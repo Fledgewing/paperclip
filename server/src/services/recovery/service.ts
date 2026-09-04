@@ -111,6 +111,37 @@ export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
   Number(process.env.STRANDED_RECENT_PROGRESS_EXEMPTION_MS) || 30 * 60 * 1000,
 );
 
+// Race protection for the `sweep_stale_issue_locks` orphan backstop.
+// When an agent process exits, the harness runs
+// `flushOutputProgress({ force: true })` and then `setRunStatusIfRunning` to
+// write the run's real terminal status. A sweep that fires inside that window
+// sees `status = "running"` with the recorded pid already reaped, claims the
+// process-death authority, and overwrites the correct terminal status with
+// "interrupted" + `errorCode = orphaned_running_run`. `lastOutputAt` is the
+// freshest signal that the harness is mid-finalize, so defer
+// orphan-terminalization while it is within this window and let the in-flight
+// write land. Floor at 1s so a misconfigured override cannot disable the
+// protection.
+export const RUN_OUTPUT_FINALIZE_GRACE_MS = Math.max(
+  1_000,
+  Number(process.env.PAPERCLIP_RUN_OUTPUT_GRACE_MS) || 60_000,
+);
+
+// True when the run produced output recently enough that its own finalize
+// write is still expected to land. Exported for tests. Callers must apply this
+// only to the process-death authority, never to the issue-terminal authority:
+// a run under a terminal issue is genuinely orphaned regardless of output.
+export function isFinalizeGraceActive(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "lastOutputAt">,
+  now: Date = new Date(),
+): boolean {
+  if (!run.lastOutputAt) return false;
+  const lastOutputMs = new Date(run.lastOutputAt).getTime();
+  if (!Number.isFinite(lastOutputMs)) return false;
+  const elapsed = now.getTime() - lastOutputMs;
+  return elapsed >= 0 && elapsed < RUN_OUTPUT_FINALIZE_GRACE_MS;
+}
+
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
@@ -4589,6 +4620,29 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (nativeResumeOwnsRun) {
         return { terminalized: false, status: run.status };
       }
+    }
+
+    // The process is gone but the run emitted output moments ago, so
+    // the harness is mid-finalize: `flushOutputProgress({ force: true })` just
+    // wrote `lastOutputAt` and `setRunStatusIfRunning` is about to write the
+    // real terminal status. Terminalizing here races that write and replaces a
+    // succeeded run with "interrupted" + `orphaned_running_run`, which is what
+    // broke every retry of a successful pass on timer-driven standing issues.
+    // Defer and let the run finalize itself; once the grace window lapses, a
+    // genuinely abandoned run still terminalizes on a later sweep. Scoped to
+    // the process-death authority only — under a terminal issue the run is
+    // orphaned no matter how fresh its output is.
+    if (!issueTerminalStatus && processGone && isFinalizeGraceActive(run)) {
+      logger.info(
+        {
+          runId: run.id,
+          issueId,
+          lastOutputAt: run.lastOutputAt,
+          graceMs: RUN_OUTPUT_FINALIZE_GRACE_MS,
+        },
+        "deferring orphan-terminalization: harness is finalizing a recently-active run",
+      );
+      return { terminalized: false, status: run.status };
     }
 
     // Neither authority applies. The run is still live, so leave it alone.
