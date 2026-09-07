@@ -1,6 +1,6 @@
-import { and, count, eq } from "drizzle-orm";
+import { and, count, eq, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -109,11 +109,54 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
-    const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    let sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+    // CAN-1720: timer/scheduler heartbeat runs (wakeReason heartbeat_timer)
+    // carry no issueId/taskId in contextSnapshot, so the original
+    // `if (!sourceIssueId) throw` denied EVERY comment and update from such a
+    // run — including writes to the agent's own assigned issue. That
+    // structurally breaks any agent whose duty runs on a bare timer cadence.
+    // Fall back to the issue this run has checked out / is executing; then
+    // treat a write to an issue the acting agent is assigned to as a
+    // self-write; then, still unresolved, METER the write under the per-run
+    // cap with a null source instead of refusing it. The cap counter is keyed
+    // on runId, not on the source issue, so enforcement is intact, and run
+    // authenticity is already established above (isUuidLike + the run row must
+    // match companyId and agentId). Issue-woken runs resolve at step 1 and are
+    // unaffected.
+    if (!sourceIssueId) {
+      sourceIssueId = await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, input.companyId),
+            or(
+              eq(issues.checkoutRunId, input.runId),
+              eq(issues.executionRunId, input.runId),
+            ),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0]?.id ?? null);
+    }
+    if (!sourceIssueId) {
+      const targetIssue = await tx
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(
+          and(eq(issues.id, input.targetIssueId), eq(issues.companyId, input.companyId)),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      // An agent writing to its own assigned issue is not cross-issue
+      // influence. Mirrors the source===target short-circuit below.
+      if (targetIssue && targetIssue.assigneeAgentId === input.agentId) return null;
+    }
     if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      sourceIssueId &&
+      (sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier &&
+          sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase()))
     ) {
       return null;
     }
