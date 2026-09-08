@@ -202,6 +202,11 @@ const codexThinkingEffortOptions = [
   { id: "xhigh", label: "X-High" },
 ] as const;
 
+const codexAstraThinkingEffortOptions = [
+  ...codexThinkingEffortOptions,
+  { id: "max", label: "Max" },
+] as const;
+
 const openCodeThinkingEffortOptions = [
   { id: "", label: "Auto" },
   { id: "minimal", label: "Minimal" },
@@ -1087,7 +1092,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
           : "effort";
   const thinkingEffortOptions =
     adapterType === "codex_local"
-      ? codexThinkingEffortOptions
+      ? currentModelId === "gpt-6-astra"
+        ? codexAstraThinkingEffortOptions
+        : codexThinkingEffortOptions
       : adapterType === "cursor"
         ? cursorModeOptions
         : adapterType === "opencode_local"

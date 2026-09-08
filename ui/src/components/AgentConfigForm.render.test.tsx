@@ -714,6 +714,35 @@ describe("AgentConfigForm environment selector", () => {
     vi.clearAllMocks();
   });
 
+  it("offers max thinking effort for gpt-6-astra and persists the selection", async () => {
+    const result = await renderCreateForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { model: "gpt-6-astra" },
+    );
+    roots.push(result.root);
+
+    await clickByText(result.container, "Auto");
+    expect(document.body.textContent).toContain("Max");
+
+    await clickElement(
+      Array.from(document.body.querySelectorAll("button")).find(
+        (button) => button.textContent?.trim() === "Maxmax",
+      ),
+    );
+    expect(result.onChange).toHaveBeenCalledWith({ thinkingEffort: "max" });
+  });
+
+  it("does not offer Astra-only max thinking effort for other Codex models", async () => {
+    const result = await renderCreateForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { model: "gpt-5.6-sol" },
+    );
+    roots.push(result.root);
+
+    await clickByText(result.container, "Auto");
+    expect(document.body.textContent).not.toContain("Max");
+  });
+
   it("hides the environment override when Local is the only configured environment", async () => {
     const result = await renderForm([
       makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
