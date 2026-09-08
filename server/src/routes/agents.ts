@@ -5952,29 +5952,69 @@ export function agentRoutes(
   });
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
-    assertBoard(req);
     const runId = req.params.runId as string;
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
-    // Stamp the cancellation as operator-initiated (this route is board-only).
-    // Recovery reads this to stand down instead of classifying the cancelled
-    // run as agent stranding and re-waking the agent the operator just stopped.
-    const run = await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
-      resultJson: {
-        cancelledByActorType: "user",
-        cancelledByUserId: req.actor.userId ?? null,
-      },
-    });
 
-    if (run) {
+    const isAgentCancellation = req.actor.type === "agent";
+    let actorAgent: Awaited<ReturnType<typeof svc.getById>> | null = null;
+    if (isAgentCancellation) {
+      actorAgent = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
+      if (!actorAgent || actorAgent.companyId !== existing.companyId) {
+        res.status(403).json({ error: "Forbidden" });
+        return;
+      }
+      if (actorAgent.role !== "ceo") {
+        res.status(403).json({ error: "Only CEO agents can cancel heartbeat runs" });
+        return;
+      }
+    } else {
+      assertBoard(req);
+    }
+
+    // Recovery reads explicit actor attribution to stand down instead of
+    // classifying a deliberate cancellation as agent stranding.
+    const cancellationSource = isAgentCancellation ? "agent_ceo" : "board_operator";
+    const cancellationKind = isAgentCancellation
+      ? "agent_ceo_verified_hung_run"
+      : "board_operator";
+    const run = await heartbeat.cancelRun(
+      runId,
+      isAgentCancellation ? "Cancelled by a same-company CEO agent" : "Cancelled by a board operator",
+      {
+        resultJson: {
+          cancelledByActorType: isAgentCancellation ? "agent" : "user",
+          cancelledByUserId: isAgentCancellation ? null : req.actor.userId ?? null,
+          cancelledByAgentId: isAgentCancellation ? actorAgent!.id : null,
+          cancelledByRunId: req.actor.runId ?? null,
+          cancellationSource,
+          cancellationKind,
+          targetAgentId: existing.agentId,
+          targetRunId: existing.id,
+        },
+      },
+    );
+
+    // cancelRun returns an already-terminal run unchanged. Do not append a
+    // second cancellation audit event for that idempotent result.
+    if (run && ["queued", "running"].includes(existing.status)) {
       await logActivity(db, {
         companyId: run.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
+        actorType: isAgentCancellation ? "agent" : "user",
+        actorId: isAgentCancellation ? actorAgent!.id : req.actor.userId ?? "board",
+        agentId: isAgentCancellation ? actorAgent!.id : null,
+        runId: req.actor.runId ?? null,
+        agentApiKeyId: req.actor.keyId ?? null,
         action: "heartbeat.cancelled",
         entityType: "heartbeat_run",
         entityId: run.id,
-        details: { agentId: run.agentId },
+        details: {
+          agentId: run.agentId,
+          targetAgentId: existing.agentId,
+          targetRunId: existing.id,
+          cancellationSource,
+          cancellationKind,
+        },
       });
     }
 

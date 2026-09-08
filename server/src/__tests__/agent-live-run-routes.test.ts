@@ -15,6 +15,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   readLog: vi.fn(),
   wakeup: vi.fn(),
   getRun: vi.fn(),
+  cancelRun: vi.fn(),
 }));
 
 const mockIssueService = vi.hoisted(() => ({
@@ -320,8 +321,14 @@ describe("agent live run routes", () => {
       id: "run-1",
       companyId: "company-1",
       agentId: "agent-1",
-      status: "succeeded",
+      status: "running",
     });
+    mockHeartbeatService.cancelRun.mockImplementation(async () => ({
+      id: "run-1",
+      companyId: "company-1",
+      agentId: "agent-1",
+      status: "cancelled",
+    }));
     mockWorkspaceOperationService.getById.mockResolvedValue({
       id: "operation-1",
       companyId: "company-1",
@@ -477,6 +484,112 @@ describe("agent live run routes", () => {
       content: "chunk",
       nextOffset: 5,
     });
+  });
+
+  it("allows board cancellation and records board attribution", async () => {
+    const res = await requestApp(await createApp(), (baseUrl) =>
+      request(baseUrl).post("/api/heartbeat-runs/run-1/cancel"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "run-1",
+      "Cancelled by a board operator",
+      expect.objectContaining({
+        resultJson: expect.objectContaining({
+          cancelledByActorType: "user",
+          cancelledByAgentId: null,
+          cancellationSource: "board_operator",
+          targetAgentId: "agent-1",
+          targetRunId: "run-1",
+        }),
+      }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      actorType: "user",
+      action: "heartbeat.cancelled",
+      details: expect.objectContaining({ cancellationSource: "board_operator" }),
+    }));
+  });
+
+  it("allows a same-company CEO agent to cancel and records agent audit metadata", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      id: routeAgentId,
+      companyId: "company-1",
+      role: "ceo",
+    });
+    const app = await createApp({}, {
+      type: "agent", agentId: routeAgentId, companyId: "company-1", runId: "ceo-run-1",
+      keyId: "agent-key-1", source: "agent_jwt",
+    });
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post("/api/heartbeat-runs/run-1/cancel"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "run-1",
+      "Cancelled by a same-company CEO agent",
+      expect.objectContaining({
+        resultJson: expect.objectContaining({
+          cancelledByActorType: "agent",
+          cancelledByAgentId: routeAgentId,
+          cancelledByRunId: "ceo-run-1",
+          cancellationSource: "agent_ceo",
+          cancellationKind: "agent_ceo_verified_hung_run",
+          targetAgentId: "agent-1",
+          targetRunId: "run-1",
+        }),
+      }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      actorType: "agent",
+      actorId: routeAgentId,
+      agentId: routeAgentId,
+      runId: "ceo-run-1",
+      agentApiKeyId: "agent-key-1",
+      details: expect.objectContaining({
+        cancellationSource: "agent_ceo",
+        cancellationKind: "agent_ceo_verified_hung_run",
+        targetAgentId: "agent-1",
+        targetRunId: "run-1",
+      }),
+    }));
+  });
+
+  it("denies ordinary same-company agents", async () => {
+    mockAgentService.getById.mockResolvedValue({ id: routeAgentId, companyId: "company-1", role: "engineer" });
+    const app = await createApp({}, {
+      type: "agent", agentId: routeAgentId, companyId: "company-1", runId: "agent-run-1", source: "agent_jwt",
+    });
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).post("/api/heartbeat-runs/run-1/cancel"));
+
+    expect(res.status).toBe(403);
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
+  it("denies cross-company CEO agents without cancelling", async () => {
+    mockAgentService.getById.mockResolvedValue({ id: routeAgentId, companyId: "company-2", role: "ceo" });
+    const app = await createApp({}, {
+      type: "agent", agentId: routeAgentId, companyId: "company-2", runId: "ceo-run-2", source: "agent_jwt",
+    });
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).post("/api/heartbeat-runs/run-1/cancel"));
+
+    expect(res.status).toBe(404);
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
+  it("returns an already-terminal run without a duplicate audit event", async () => {
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-1", companyId: "company-1", agentId: "agent-1", status: "cancelled",
+    });
+    mockHeartbeatService.cancelRun.mockResolvedValue({
+      id: "run-1", companyId: "company-1", agentId: "agent-1", status: "cancelled",
+    });
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl).post("/api/heartbeat-runs/run-1/cancel"));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
   it.each(["skill_test", "task_bridge"])(
