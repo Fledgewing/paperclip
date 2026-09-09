@@ -9,23 +9,13 @@ import { join } from "node:path";
 
 const cliRoot = realpathSync(join(homedir(), ".paperclip/cli/current"));
 const target = join(cliRoot, "node_modules/@paperclipai/server/dist/routes/agents.js");
+const recoveryTarget = join(cliRoot, "node_modules/@paperclipai/server/dist/services/recovery/service.js");
 const marker = "// CAN-1938: CEO agents may cancel same-company heartbeat runs.";
+const recoveryMarker = "// CAN-1938: same-company CEO cancellations are authorized stops.";
 const src = readFileSync(target, "utf8");
-if (src.includes(marker)) {
-  const legacyAuditKey = "agentApiKeyId: req.actor.agentApiKeyId ?? null";
-  if (src.includes(legacyAuditKey)) {
-    const backup = `${target}.can1938-prepatch`;
-    copyFileSync(target, backup);
-    writeFileSync(target, src.replace(legacyAuditKey, "agentApiKeyId: req.actor.keyId ?? null"), "utf8");
-    console.log(`upgraded CAN-1938 audit key attribution: ${target}`);
-    console.log(`backup: ${backup}`);
-    process.exit(10);
-  }
-  console.log(`already applied: ${target}`);
-  process.exit(0);
-}
-
-const anchor = `    router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
+let changed = false;
+if (!src.includes(marker)) {
+  const anchor = `    router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
         assertBoard(req);
         const runId = req.params.runId;
         const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
@@ -54,7 +44,7 @@ const anchor = `    router.post("/heartbeat-runs/:runId/cancel", async (req, res
         res.json(run);
     });`;
 
-const replacement = `    router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
+  const replacement = `    router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
         const runId = req.params.runId;
         const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
         if (!existing)
@@ -115,21 +105,51 @@ const replacement = `    router.post("/heartbeat-runs/:runId/cancel", async (req
         res.json(run);
     });`;
 
-if (!src.includes(anchor)) {
-  console.error(`ANCHOR MISSING: ${target} changed; port CAN-1938 manually.`);
-  process.exit(2);
+  if (!src.includes(anchor)) {
+    console.error(`ANCHOR MISSING: ${target} changed; port CAN-1938 manually.`);
+    process.exit(2);
+  }
+  const backup = `${target}.can1938-prepatch`;
+  copyFileSync(target, backup);
+  writeFileSync(target, src.replace(anchor, replacement), "utf8");
+  changed = true;
 }
-const backup = `${target}.can1938-prepatch`;
-copyFileSync(target, backup);
-writeFileSync(target, src.replace(anchor, replacement), "utf8");
+else {
+  const legacyAuditKey = "agentApiKeyId: req.actor.agentApiKeyId ?? null";
+  if (src.includes(legacyAuditKey)) {
+    const backup = `${target}.can1938-prepatch`;
+    copyFileSync(target, backup);
+    writeFileSync(target, src.replace(legacyAuditKey, "agentApiKeyId: req.actor.keyId ?? null"), "utf8");
+    changed = true;
+    console.log(`upgraded CAN-1938 audit key attribution: ${target}`);
+    console.log(`backup: ${backup}`);
+  }
+}
+
+const recoverySrc = readFileSync(recoveryTarget, "utf8");
+if (!recoverySrc.includes(recoveryMarker)) {
+  const recoveryAnchor = '    return result.cancelledByActorType === "user" || result.cancelledByActorType === "board";';
+  const recoveryReplacement = `    // CAN-1938: same-company CEO cancellations are authorized stops.
+    return result.cancelledByActorType === "user" ||
+        result.cancelledByActorType === "board" ||
+        (result.cancelledByActorType === "agent" && result.cancellationSource === "agent_ceo");`;
+  if (!recoverySrc.includes(recoveryAnchor)) {
+    console.error(`RECOVERY ANCHOR MISSING: ${recoveryTarget} changed; port CAN-1938 manually.`);
+    process.exit(2);
+  }
+  const recoveryBackup = `${recoveryTarget}.can1938-prepatch`;
+  copyFileSync(recoveryTarget, recoveryBackup);
+  writeFileSync(recoveryTarget, recoverySrc.replace(recoveryAnchor, recoveryReplacement), "utf8");
+  changed = true;
+}
 try {
   execFileSync(process.execPath, ["--check", target], { stdio: "pipe" });
+  execFileSync(process.execPath, ["--check", recoveryTarget], { stdio: "pipe" });
 } catch (error) {
-  copyFileSync(backup, target);
-  console.error(`node --check failed; restored ${target} from ${backup}`);
+  console.error("node --check failed after CAN-1938 patch application");
   console.error(error.stderr?.toString() ?? error.message);
   process.exit(3);
 }
-console.log(`applied CAN-1938 to ${target}`);
-console.log(`backup: ${backup}`);
-process.exit(10);
+console.log(`CAN-1938 verified: ${target}`);
+console.log(`CAN-1938 verified: ${recoveryTarget}`);
+process.exit(changed ? 10 : 0);

@@ -654,18 +654,20 @@ function isStrandedIssueRecoveryIssue(issue: Pick<typeof issues.$inferSelect, "o
 }
 
 /**
- * True when the issue's latest run was cancelled by a board operator (the
- * board cancel route stamps the attribution; interrupt-by-comment uses the
- * operator_interrupted error code). While such a run is the latest activity
- * on an issue, recovery stands down entirely: the operator deliberately
- * stopped the agent, and re-waking it — or escalating "stranding" — would
- * fight the human. Any newer run or wake supersedes the exemption.
+ * True when the issue's latest run was deliberately cancelled by an authorized
+ * board operator or same-company CEO agent (the cancel route stamps that
+ * attribution; interrupt-by-comment uses the operator_interrupted error code).
+ * While such a run is the latest activity on an issue, recovery stands down:
+ * re-waking it — or escalating "stranding" — would undo the authorized stop.
+ * Any newer run or wake supersedes the exemption.
  */
 function isOperatorCancelledRun(latestRun: LatestIssueRun): boolean {
   if (!latestRun || latestRun.status !== "cancelled") return false;
   if (latestRun.errorCode === "operator_interrupted") return true;
   const result = parseObject(latestRun.resultJson);
-  return result.cancelledByActorType === "user" || result.cancelledByActorType === "board";
+  return result.cancelledByActorType === "user" ||
+    result.cancelledByActorType === "board" ||
+    (result.cancelledByActorType === "agent" && result.cancellationSource === "agent_ceo");
 }
 
 function isUnsuccessfulTerminalIssueRun(latestRun: LatestIssueRun) {

@@ -687,6 +687,36 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  it("stands down while the latest run was cancelled by a same-company CEO agent", async () => {
+    const { companyId, coderId, managerId, sourceIssueId } = await seedCompany();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "cancelled",
+      error: "Cancelled by a same-company CEO agent",
+      errorCode: "cancelled",
+      resultJson: {
+        cancelledByActorType: "agent",
+        cancelledByAgentId: managerId,
+        cancellationSource: "agent_ceo",
+        cancellationKind: "agent_ceo_verified_hung_run",
+      },
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.operatorCancelExempted).toBe(1);
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
   it("stands down after an operator interrupt cancellation", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     await db.insert(heartbeatRuns).values({
