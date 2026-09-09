@@ -5305,6 +5305,9 @@ export function issueService(db: Db) {
         return { adopted: null, latest: lockedIssue };
       }
 
+      const expectedExecutionRunId = lockedIssue.executionRunId;
+      const executionRunDiffersFromCheckout =
+        expectedExecutionRunId !== null && expectedExecutionRunId !== input.expectedCheckoutRunId;
       await Promise.all([
         tx.execute(
           sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.expectedCheckoutRunId} for update`,
@@ -5312,8 +5315,13 @@ export function issueService(db: Db) {
         tx.execute(
           sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
         ),
+        ...(executionRunDiffersFromCheckout
+          ? [tx.execute(
+              sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${expectedExecutionRunId!} for update`,
+            )]
+          : []),
       ]);
-      const [existingRun, actorRun] = await Promise.all([
+      const [existingRun, actorRun, executionRun] = await Promise.all([
         tx
           .select({ status: heartbeatRuns.status })
           .from(heartbeatRuns)
@@ -5324,10 +5332,23 @@ export function issueService(db: Db) {
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, input.actorRunId))
           .then((rows) => rows[0] ?? null),
+        executionRunDiffersFromCheckout
+          ? tx
+              .select({ status: heartbeatRuns.status })
+              .from(heartbeatRuns)
+              .where(eq(heartbeatRuns.id, expectedExecutionRunId!))
+              .then((rows) => rows[0] ?? null)
+          : Promise.resolve(null),
       ]);
       const stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
       const actorLive = actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
-      if (!stale || !actorLive) {
+      const executionLockIsStaleOrOwned =
+        !expectedExecutionRunId ||
+        expectedExecutionRunId === input.expectedCheckoutRunId ||
+        expectedExecutionRunId === input.actorRunId ||
+        !executionRun ||
+        TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status);
+      if (!stale || !actorLive || !executionLockIsStaleOrOwned) {
         return { adopted: null, latest: lockedIssue };
       }
 
@@ -5346,6 +5367,9 @@ export function issueService(db: Db) {
             eq(issues.status, "in_progress"),
             eq(issues.assigneeAgentId, input.actorAgentId),
             eq(issues.checkoutRunId, input.expectedCheckoutRunId),
+            expectedExecutionRunId === null
+              ? isNull(issues.executionRunId)
+              : eq(issues.executionRunId, expectedExecutionRunId),
           ),
         )
         .returning({

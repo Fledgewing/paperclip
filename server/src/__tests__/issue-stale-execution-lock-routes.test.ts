@@ -316,8 +316,71 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
   });
 
-  it("still returns 409 when a different live checkout owner is active", async () => {
-    const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
+  it("lets the current assignee schedule a monitor after a terminal foreign owner", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const foreignRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: foreignRunId,
+      companyId,
+      agentId,
+      status: "succeeded",
+      invocationSource: "manual",
+      finishedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stale monitor owner",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: foreignRunId,
+      executionRunId: foreignRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
+
+    const nextCheckAt = "2026-12-01T12:00:00.000Z";
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            kind: "external_service",
+            serviceName: "github-actions",
+            externalRef: "Fledgewing/TallTale",
+            nextCheckAt,
+            timeoutAt: "2026-12-02T12:00:00.000Z",
+            maxAttempts: 3,
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.monitorNextCheckAt).toBe(nextCheckAt);
+
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      monitorNextCheckAt: new Date(nextCheckAt),
+    });
+  });
+
+  it("still rejects monitor scheduling when a different live execution owner is active", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
     const liveOwnerRunId = randomUUID();
     const issueId = randomUUID();
     await db.insert(heartbeatRuns).values({
@@ -335,18 +398,39 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       status: "in_progress",
       priority: "high",
       assigneeAgentId: agentId,
-      checkoutRunId: liveOwnerRunId,
+      checkoutRunId: failedRunId,
       executionRunId: liveOwnerRunId,
       executionAgentNameKey: "codexcoder",
       executionLockedAt: new Date(),
     });
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
 
-    const res = await request(createApp(agentActor(companyId, agentId, failedRunId)))
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
       .patch(`/api/issues/${issueId}`)
-      .send({ title: "Should fail" });
+      .send({
+        executionPolicy: {
+          monitor: {
+            kind: "external_service",
+            serviceName: "github-actions",
+            externalRef: "Fledgewing/TallTale",
+            nextCheckAt: "2026-12-01T12:00:00.000Z",
+            timeoutAt: "2026-12-02T12:00:00.000Z",
+            maxAttempts: 3,
+          },
+        },
+      });
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(res.body?.error).toBe("Issue run ownership conflict");
+
+    const row = await db
+      .select({ monitorNextCheckAt: issues.monitorNextCheckAt })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ monitorNextCheckAt: null });
   });
 
   it("preserves live checkout ownership on checkout conflicts without retry side effects", async () => {
