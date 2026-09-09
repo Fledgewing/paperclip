@@ -1020,6 +1020,12 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+// Adapter-level timeouts are optional, but the control plane must still put an
+// upper bound on a heartbeat occupying an agent lane. Without this independent
+// deadline, a wedged adapter that remains tracked in memory is skipped by the
+// orphan reaper forever and leaves both the task and every queued wake behind
+// it stranded.
+const DEFAULT_HEARTBEAT_RUN_MAX_AGE_MS = 60 * 60 * 1000;
 // Background heartbeat executions are dispatched fire-and-forget (see
 // startNextQueuedRunForAgent), so the promise that resolves once a run's DB
 // writes are fully flushed is otherwise unobservable. Track those promises here
@@ -16515,8 +16521,12 @@ export function heartbeatService(
     return blocked;
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  async function reapOrphanedRuns(opts?: {
+    staleThresholdMs?: number;
+    maxRunAgeMs?: number;
+  }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+    const maxRunAgeMs = opts?.maxRunAgeMs ?? DEFAULT_HEARTBEAT_RUN_MAX_AGE_MS;
     const now = new Date();
 
     // Complete persisted native results before generic orphan recovery. The
@@ -16749,6 +16759,28 @@ export function heartbeatService(
       adapterConfig,
       nativeCoordinatorPhase,
     } of activeRuns) {
+      const runStartedAt =
+        run.startedAt ?? run.processStartedAt ?? run.createdAt;
+      const runAgeMs = now.getTime() - runStartedAt.getTime();
+      if (maxRunAgeMs > 0 && runAgeMs >= maxRunAgeMs) {
+        const maxRunAgeMinutes = Math.round(maxRunAgeMs / 60_000);
+        const reason = `Run exceeded the Paperclip control-plane limit of ${maxRunAgeMinutes} minutes`;
+        const cancelled = await cancelRunInternal(run.id, reason, {
+          errorCode: "control_plane_run_timeout",
+          eventMessage: "run cancelled by control-plane maximum age watchdog",
+          eventPayload: {
+            runAgeMs,
+            maxRunAgeMs,
+            startedAt: runStartedAt.toISOString(),
+          },
+          resultJson: {
+            controlPlaneTimeout: true,
+            maxRunAgeMs,
+          },
+        });
+        if (cancelled?.status === "cancelled") reaped.push(run.id);
+        continue;
+      }
       const nativeRun = run.runtimeMode === "native";
       const nativeProcessPidAlive =
         nativeRun && !!run.processPid && isProcessAlive(run.processPid);

@@ -730,6 +730,73 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(settledRun?.status).toBe("succeeded");
   });
 
+  it("cancels an in-memory adapter execution that exceeds the control-plane maximum age", async () => {
+    let releaseAdapter: (() => void) | null = null;
+    const adapterStarted = new Promise<void>((resolve) => {
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        resolve();
+        await new Promise<void>((release) => {
+          releaseAdapter = release;
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Late adapter completion.",
+          provider: "test",
+          model: "test-model",
+        };
+      });
+    });
+
+    const { runId, wakeupRequestId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      runStatus: "queued",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+    });
+    const executorHeartbeat = heartbeatService(db);
+    const reaperHeartbeat = heartbeatService(db);
+
+    await executorHeartbeat.resumeQueuedRuns();
+    await adapterStarted;
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: new Date(Date.now() - 2_000) })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const result = await reaperHeartbeat.reapOrphanedRuns({
+      maxRunAgeMs: 1_000,
+    });
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+    const timedOutRun = await reaperHeartbeat.getRun(runId);
+    expect(timedOutRun).toMatchObject({
+      status: "cancelled",
+      errorCode: "control_plane_run_timeout",
+    });
+    expect(timedOutRun?.resultJson).toMatchObject({
+      controlPlaneTimeout: true,
+      maxRunAgeMs: 1_000,
+    });
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("cancelled");
+
+    if (!releaseAdapter)
+      throw new Error("Adapter release handle was not captured");
+    releaseAdapter();
+    await executorHeartbeat.drainActiveRunExecutions();
+    expect((await reaperHeartbeat.getRun(runId))?.status).toBe("cancelled");
+  });
+
   async function seedStrandedIssueFixture(input: {
     status: "todo" | "in_progress";
     runStatus: "failed" | "timed_out" | "cancelled" | "succeeded";
