@@ -176,6 +176,7 @@ import {
   type IssueGraphLivenessInput,
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
+import { isRunLivePath } from "./run-live-path.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
@@ -3319,6 +3320,9 @@ type IssueBlockerAttentionQueryRow = IssueBlockerAttentionNode & {
 };
 type IssueBlockerAttentionActivePathRow = {
   issueId: string | null;
+  status?: string | null;
+  createdAt?: Date | string | null;
+  startedAt?: Date | string | null;
 };
 type IssueBlockerAttentionAgentRow = {
   id: string;
@@ -3766,6 +3770,7 @@ async function listIssueBlockerAttentionMap(
   }
   if (roots.length === 0) return attentionMap;
 
+  const livePathNow = new Date();
   const nodesById = new Map<string, IssueBlockerAttentionNode>();
   const edgesByIssueId = new Map<string, IssueBlockerAttentionEdge[]>();
   for (const root of roots) nodesById.set(root.id, { ...root });
@@ -3915,9 +3920,17 @@ async function listIssueBlockerAttentionMap(
     [...issueIdByExecutionRunId.keys()],
     ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE,
   )) {
-    const runRows: Array<{ id: string }> = await dbOrTx
+    const runRows: Array<{
+      id: string;
+      status: string;
+      createdAt: Date | string | null;
+      startedAt: Date | string | null;
+    }> = await dbOrTx
       .select({
         id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        createdAt: heartbeatRuns.createdAt,
+        startedAt: heartbeatRuns.startedAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -3929,6 +3942,7 @@ async function listIssueBlockerAttentionMap(
       );
 
     for (const row of runRows) {
+      if (!isRunLivePath(row, livePathNow)) continue;
       const issueId = issueIdByExecutionRunId.get(row.id);
       if (issueId) activeIssueIds.add(issueId);
     }
@@ -3941,6 +3955,8 @@ async function listIssueBlockerAttentionMap(
           issueId: sql<
             string | null
           >`${agentWakeupRequests.payload} ->> 'issueId'`,
+          status: agentWakeupRequests.status,
+          createdAt: agentWakeupRequests.requestedAt,
         })
         .from(agentWakeupRequests)
         .where(
@@ -3959,7 +3975,11 @@ async function listIssueBlockerAttentionMap(
         );
     const wakeRows = await wakeRowsPromise;
     for (const row of wakeRows) {
-      if (row.issueId) activeIssueIds.add(row.issueId);
+      if (!row.issueId) continue;
+      if (!isRunLivePath({ status: row.status ?? "queued", createdAt: row.createdAt ?? null, startedAt: null }, livePathNow)) {
+        continue;
+      }
+      activeIssueIds.add(row.issueId);
     }
   }
 
@@ -4067,6 +4087,9 @@ async function listIssueBlockerAttentionMap(
             recoveryActionId: sql<
               string | null
             >`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId'`,
+            status: heartbeatRuns.status,
+            createdAt: heartbeatRuns.createdAt,
+            startedAt: heartbeatRuns.startedAt,
           })
           .from(heartbeatRuns)
           .where(
@@ -4087,6 +4110,8 @@ async function listIssueBlockerAttentionMap(
             recoveryActionId: sql<
               string | null
             >`${agentWakeupRequests.payload} ->> 'recoveryActionId'`,
+            status: agentWakeupRequests.status,
+            createdAt: agentWakeupRequests.requestedAt,
           })
           .from(agentWakeupRequests)
           .where(
@@ -4104,8 +4129,15 @@ async function listIssueBlockerAttentionMap(
           ),
       ]);
       for (const row of [...runRows, ...wakeRows]) {
-        if (row.recoveryActionId)
-          liveRecoveryActionIds.add(row.recoveryActionId);
+        if (!row.recoveryActionId) continue;
+        if (!isRunLivePath({
+          status: row.status,
+          createdAt: row.createdAt ?? null,
+          startedAt: "startedAt" in row ? row.startedAt ?? null : null,
+        }, livePathNow)) {
+          continue;
+        }
+        liveRecoveryActionIds.add(row.recoveryActionId);
       }
     }
     for (const row of recoveryActionRows) {
@@ -4565,6 +4597,7 @@ async function listIssueReviewAttentionMap(
         agentId: heartbeatRuns.agentId,
         status: heartbeatRuns.status,
         createdAt: heartbeatRuns.createdAt,
+        startedAt: heartbeatRuns.startedAt,
       })
       .from(heartbeatRuns)
       .where(

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { DEFAULT_STALE_QUEUED_RUN_MS } from "../services/run-live-path.ts";
 import { classifyTaskWatchdogSubtree, type TaskWatchdogClassifierIssue } from "../services/task-watchdogs.ts";
 
 const companyId = "company-1";
@@ -48,6 +49,27 @@ describe("task watchdog subtree classifier", () => {
       state: "live",
       liveIssueIds: [childId],
     });
+  });
+
+  it("does not treat a never-started queued run past the stale bound as a live path", () => {
+    const evaluatedAt = new Date("2026-09-10T12:00:00.000Z");
+    const result = classify({
+      issues: [
+        issue(),
+        issue({ id: childId, identifier: "PAP-2", parentId: sourceId, status: "in_review" }),
+      ],
+      activeRuns: [{
+        companyId,
+        issueId: childId,
+        agentId: "agent-1",
+        status: "queued",
+        startedAt: null,
+        createdAt: new Date(evaluatedAt.getTime() - DEFAULT_STALE_QUEUED_RUN_MS - 1),
+      }],
+      evaluatedAt,
+    });
+
+    expect(result.state).toBe("stopped");
   });
 
   it("treats terminal and waiting leaves as stopped work that needs verification", () => {

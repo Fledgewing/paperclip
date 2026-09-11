@@ -23,6 +23,7 @@ import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { TASK_WATCHDOG_ORIGIN_KIND } from "./task-watchdog-scope.js";
+import { isRunLivePath } from "./run-live-path.js";
 
 const TASK_WATCHDOG_STOP_FINGERPRINT_PREFIX = "task_watchdog_stop:";
 const TASK_WATCHDOG_SUBTREE_MAX_DEPTH = 100;
@@ -81,6 +82,8 @@ export type TaskWatchdogClassifierPath = {
   issueId: string | null;
   agentId?: string | null;
   status: string;
+  createdAt?: Date | string | null;
+  startedAt?: Date | string | null;
 };
 
 export type TaskWatchdogClassifierWaitingPath = {
@@ -282,10 +285,19 @@ function toEpochMs(value: Date | string | null | undefined): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
-function pathIssueIds(paths: TaskWatchdogClassifierPath[] | undefined, companyId: string) {
+function pathIssueIds(
+  paths: TaskWatchdogClassifierPath[] | undefined,
+  companyId: string,
+  now: Date | string | number,
+) {
   return new Set(
     (paths ?? [])
-      .filter((path) => path.companyId === companyId && typeof path.issueId === "string" && path.issueId.length > 0)
+      .filter((path) =>
+        path.companyId === companyId &&
+        typeof path.issueId === "string" &&
+        path.issueId.length > 0 &&
+        isRunLivePath(path, now)
+      )
       .map((path) => path.issueId as string),
   );
 }
@@ -408,9 +420,10 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
 
   const includedIds = included.map((issue) => issue.id);
   const includedIdSet = new Set(includedIds);
+  const livePathNow = input.evaluatedAt ?? new Date();
   const liveIssueIds = [
-    ...pathIssueIds(input.activeRuns, input.watchdog.companyId),
-    ...pathIssueIds(input.queuedWakeRequests, input.watchdog.companyId),
+    ...pathIssueIds(input.activeRuns, input.watchdog.companyId, livePathNow),
+    ...pathIssueIds(input.queuedWakeRequests, input.watchdog.companyId, livePathNow),
   ].filter((issueId) => includedIdSet.has(issueId));
   const uniqueLiveIssueIds = [...new Set(liveIssueIds)].sort();
   if (uniqueLiveIssueIds.length > 0) {
@@ -955,6 +968,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           companyId: heartbeatRuns.companyId,
           agentId: heartbeatRuns.agentId,
           status: heartbeatRuns.status,
+          createdAt: heartbeatRuns.createdAt,
+          startedAt: heartbeatRuns.startedAt,
           contextSnapshot: heartbeatRuns.contextSnapshot,
         })
         .from(heartbeatRuns)
@@ -971,6 +986,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           companyId: issues.companyId,
           agentId: heartbeatRuns.agentId,
           status: heartbeatRuns.status,
+          createdAt: heartbeatRuns.createdAt,
+          startedAt: heartbeatRuns.startedAt,
           issueId: issues.id,
         })
         .from(issues)
@@ -986,6 +1003,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           companyId: agentWakeupRequests.companyId,
           agentId: agentWakeupRequests.agentId,
           status: agentWakeupRequests.status,
+          createdAt: agentWakeupRequests.requestedAt,
           payload: agentWakeupRequests.payload,
         })
         .from(agentWakeupRequests)
@@ -1107,12 +1125,16 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         companyId: row.companyId,
         agentId: row.agentId,
         status: row.status,
+        createdAt: row.createdAt,
+        startedAt: row.startedAt,
         issueId: issueIdFromRunContext(row.contextSnapshot),
       })).concat(activeIssueRunRows),
       queuedWakeRequests: wakeRows.map((row) => ({
         companyId: row.companyId,
         agentId: row.agentId,
         status: row.status,
+        createdAt: row.createdAt,
+        startedAt: null,
         issueId: issueIdFromWakePayload(row.payload),
       })),
       blockers: blockerRows,

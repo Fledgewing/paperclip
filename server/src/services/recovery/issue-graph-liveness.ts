@@ -1,4 +1,5 @@
 import { getAgentWorkEligibility, isAgentInvokable } from "@paperclipai/shared";
+import { isRunLivePath } from "../run-live-path.js";
 import { buildIssueGraphLivenessIncidentKey } from "./origins.js";
 
 export type IssueLivenessSeverity = "warning" | "critical";
@@ -53,6 +54,7 @@ export interface IssueLivenessExecutionPathInput {
   agentId?: string | null;
   status: string;
   createdAt?: Date | string | null;
+  startedAt?: Date | string | null;
 }
 
 export interface IssueLivenessWaitingPathInput {
@@ -154,9 +156,13 @@ function hasActiveExecutionPath(
   issueId: string,
   activeRuns: IssueLivenessExecutionPathInput[],
   queuedWakeRequests: IssueLivenessExecutionPathInput[],
+  now: Date | string | number,
 ) {
   return [...activeRuns, ...queuedWakeRequests].some(
-    (entry) => entry.companyId === companyId && entry.issueId === issueId,
+    (entry) =>
+      entry.companyId === companyId &&
+      entry.issueId === issueId &&
+      isRunLivePath(entry, now),
   );
 }
 
@@ -263,6 +269,7 @@ export function classifyIssueReviewPaths(
   ) => {
     for (const entry of entries) {
       if (entry.companyId !== issue.companyId || entry.issueId !== issue.id) continue;
+      if (!isRunLivePath(entry, nowMs)) continue;
       paths.push({
         kind,
         ref: entry.id ?? null,
@@ -514,7 +521,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   function hasExplicitWaitingPath(issue: IssueLivenessIssueInput) {
     return Boolean(issue.assigneeUserId) ||
       hasScheduledIssueMonitorPath(issue, nowMs) ||
-      hasActiveExecutionPath(issue.companyId, issue.id, activeRuns, queuedWakeRequests) ||
+      hasActiveExecutionPath(issue.companyId, issue.id, activeRuns, queuedWakeRequests, nowMs) ||
       hasWaitingPath(issue.companyId, issue.id, pendingInteractions) ||
       hasWaitingPath(issue.companyId, issue.id, pendingApprovals) ||
       hasWaitingPath(issue.companyId, issue.id, openRecoveryIssues);
