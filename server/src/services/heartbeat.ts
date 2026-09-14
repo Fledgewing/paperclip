@@ -1243,6 +1243,29 @@ const failedProcessRunCancellations = new Map<
   string,
   { settled: Promise<void>; failed: boolean; error?: unknown }
 >();
+// Adapter-level timeouts are optional, but the control plane must still put an
+// upper bound on a heartbeat occupying an agent lane. Without this independent
+// deadline, a wedged adapter that remains tracked in memory is skipped by the
+// orphan reaper forever and leaves both the task and every queued wake behind
+// it stranded.
+//
+// CAN-3606 split the previous single-window watchdog into two independent
+// ceilings so legitimate coding/test work can exceed 60 minutes without a
+// pre-launch queue delay consuming the budget:
+//   - QUEUED_RUN_MAX_AGE_MS bounds the queue/lease window. A run that has not
+//     launched its adapter process within this window from `createdAt` is
+//     reaped with `timeoutKind: "queue"`.
+//   - ACTIVE_RUN_MAX_AGE_MS bounds the active adapter window, measured from
+//     `processStartedAt` (with `startedAt` as the fallback for runs that never
+//     logged an explicit process launch). A run whose active execution age
+//     crosses this window is reaped with `timeoutKind: "active"`.
+//
+// The `DEFAULT_HEARTBEAT_RUN_MAX_AGE_MS` alias is preserved as the active
+// ceiling so any direct caller or test that still passes a single budget
+// continues to work and is documented to mean the active post-launch window.
+const DEFAULT_HEARTBEAT_QUEUED_RUN_MAX_AGE_MS = 60 * 60 * 1000;
+const DEFAULT_HEARTBEAT_ACTIVE_RUN_MAX_AGE_MS = 60 * 60 * 1000;
+const DEFAULT_HEARTBEAT_RUN_MAX_AGE_MS = DEFAULT_HEARTBEAT_ACTIVE_RUN_MAX_AGE_MS;
 // Background heartbeat executions are dispatched fire-and-forget (see
 // startNextQueuedRunForAgent), so the promise that resolves once a run's DB
 // writes are fully flushed is otherwise unobservable. Track those promises here
@@ -4300,6 +4323,49 @@ function parseNativeSessionGoalControl(
     ...(tokenBudget !== undefined ? { tokenBudget } : {}),
   };
 }
+/**
+ * Parse a non-negative integer millisecond budget from an env value,
+ * returning the documented fallback when the input is missing, blank, has
+ * trailing garbage, or is not a finite safe integer. Used to surface
+ * PAPERCLIP_HEARTBEAT_*_RUN_MAX_AGE_MS as operator overrides without
+ * crashing on garbage values (CAN-3606).
+ */
+function readHeartbeatRunAgeLimitMs(
+  raw: string | undefined,
+  fallback: number,
+): number {
+  if (typeof raw !== "string") return fallback;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return fallback;
+  // `Number.parseInt` silently truncates partially-parseable values
+  // (`"1.5" -> 1`, `"1e6" -> 1`, `"1000ms" -> 1000`). Reject anything that is
+  // not the full trimmed value as a non-negative integer (Greptile Issue 4).
+  if (!/^[0-9]+$/.test(trimmed)) return fallback;
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) return fallback;
+  return parsed;
+}
+
+/**
+ * Resolve the queue/lease and active adapter ceilings for the heartbeat
+ * run-age watchdog. Each is independently overridable through env vars and
+ * falls back to its documented default when unset (CAN-3606).
+ */
+export function resolveHeartbeatRunAgeLimits(
+  env: Record<string, string | undefined>,
+): {
+  activeRunMaxAgeMs: number;
+  queuedRunMaxAgeMs: number;
+} {
+  const activeRunMaxAgeMs = readHeartbeatRunAgeLimitMs(
+    env.PAPERCLIP_HEARTBEAT_ACTIVE_RUN_MAX_AGE_MS,
+    DEFAULT_HEARTBEAT_ACTIVE_RUN_MAX_AGE_MS,
+  );
+  const queuedRunMaxAgeMs = readHeartbeatRunAgeLimitMs(
+    env.PAPERCLIP_HEARTBEAT_QUEUED_RUN_MAX_AGE_MS,
+    DEFAULT_HEARTBEAT_QUEUED_RUN_MAX_AGE_MS,
+  );
+  return { activeRunMaxAgeMs, queuedRunMaxAgeMs };
 
 function sanitizeAgentSessionMessageText(value: unknown): string | null {
   const text = readNonEmptyString(value);
@@ -18322,6 +18388,7 @@ export function heartbeatService(
     agentId: string;
     succeeded: boolean;
   }) {
+  }) {
     const settledRun = await getRun(input.runId);
     const workspaceSyncReference = readNativeWorkspaceSyncReference(
       parseObject(settledRun?.runnerProfileJson).nativeWorkspaceSync,
@@ -18376,9 +18443,25 @@ export function heartbeatService(
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  async function reapOrphanedRuns(opts?: {
+    staleThresholdMs?: number;
+    // Legacy single-budget knob. Preserved as an alias for the active adapter
+    // ceiling so existing callers and tests still mean what they used to mean.
+    maxRunAgeMs?: number;
+    // Explicit overrides for the two independent windows split by CAN-3606.
+    maxActiveRunAgeMs?: number;
+    maxQueuedRunAgeMs?: number;
+    now?: Date;
+  }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
-    const now = new Date();
+    const limits = resolveHeartbeatRunAgeLimits(runtimeEnv);
+    const maxActiveRunAgeMs =
+      opts?.maxActiveRunAgeMs ??
+      opts?.maxRunAgeMs ??
+      limits.activeRunMaxAgeMs;
+    const maxQueuedRunAgeMs =
+      opts?.maxQueuedRunAgeMs ?? limits.queuedRunMaxAgeMs;
+    const now = opts?.now ?? new Date();
 
     // Complete persisted native results before generic orphan recovery. The
     // reconciler reads the durable workspace barrier and persisted runtime
@@ -18634,6 +18717,72 @@ export function heartbeatService(
       // Authentication timeout requires an explicit ownership resolution, not
       // repeated reattachment or a process-gone guess on subsequent sweeps.
       if (isNativeRunnerOwnershipHeld(run)) continue;
+      // CAN-3606: the legacy selector `startedAt ?? processStartedAt ??
+      // createdAt` rolled pre-launch queue delay into the same budget that
+      // measured active adapter execution, which killed legitimate coding and
+      // test runs whose adapter launch landed several minutes after the wake
+      // claim. The two windows are now bounded separately below.
+      const processLaunched = run.processStartedAt !== null;
+      const queueReapMs = processLaunched
+        ? 0
+        : now.getTime() - run.createdAt.getTime();
+      if (maxQueuedRunAgeMs > 0 && queueReapMs >= maxQueuedRunAgeMs) {
+        const maxQueueRunAgeMinutes = Math.round(maxQueuedRunAgeMs / 60_000);
+        const reason = `Run exceeded the Paperclip control-plane queue/lease limit of ${maxQueueRunAgeMinutes} minutes without launching its adapter process`;
+        const cancelled = await cancelRunInternal(run.id, reason, {
+          errorCode: "control_plane_run_timeout",
+          eventMessage:
+            "run cancelled by control-plane queue/lease watchdog (no adapter launch)",
+          eventPayload: {
+            timeoutKind: "queue",
+            runAgeMs: queueReapMs,
+            maxRunAgeMs: maxQueuedRunAgeMs,
+            createdAt: run.createdAt.toISOString(),
+          },
+          resultJson: {
+            controlPlaneTimeout: true,
+            timeoutKind: "queue",
+            maxRunAgeMs: maxQueuedRunAgeMs,
+          },
+        });
+        if (cancelled?.status === "cancelled") reaped.push(run.id);
+        continue;
+      }
+
+      // CAN-3606: a never-started run (no `processStartedAt`, no `startedAt`)
+      // is already gated by the queue/lease ceiling above; if it survives that
+      // gate it is still in the queue, so it has no active anchor and the
+      // active ceiling must not silently re-classify it as out-of-budget.
+      // Without this guard, an in-memory adapter that never logged a process
+      // launch but also never logged `startedAt` would have hit the
+      // `activeRunAgeMs = Number.POSITIVE_INFINITY` branch and been reaped
+      // with `timeoutKind: "active"` even though no active execution
+      // occurred (Greptile Issue 1).
+      const activeAnchor = run.processStartedAt ?? run.startedAt;
+      if (!activeAnchor) continue;
+      const activeRunAgeMs = now.getTime() - activeAnchor.getTime();
+      if (maxActiveRunAgeMs > 0 && activeRunAgeMs >= maxActiveRunAgeMs) {
+        const maxRunAgeMinutes = Math.round(maxActiveRunAgeMs / 60_000);
+        const reason = `Run exceeded the Paperclip control-plane active limit of ${maxRunAgeMinutes} minutes`;
+        const cancelled = await cancelRunInternal(run.id, reason, {
+          errorCode: "control_plane_run_timeout",
+          eventMessage:
+            "run cancelled by control-plane active maximum age watchdog",
+          eventPayload: {
+            timeoutKind: "active",
+            runAgeMs: activeRunAgeMs,
+            maxRunAgeMs: maxActiveRunAgeMs,
+            activeAnchorAt: activeAnchor ? activeAnchor.toISOString() : null,
+          },
+          resultJson: {
+            controlPlaneTimeout: true,
+            timeoutKind: "active",
+            maxRunAgeMs: maxActiveRunAgeMs,
+          },
+        });
+        if (cancelled?.status === "cancelled") reaped.push(run.id);
+        continue;
+      }
       const nativeRun = run.runtimeMode === "native";
       const nativeProcessPidAlive =
         nativeRun && !!run.processPid && isProcessAlive(run.processPid);
