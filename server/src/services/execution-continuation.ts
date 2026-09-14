@@ -16,6 +16,159 @@ const object = (v: unknown): Record<string, unknown> =>
     : {};
 const string = (v: unknown) =>
   typeof v === "string" && v.length > 0 ? v : null;
+
+// A bounded executionContinuation envelope keeps the wake prompt's
+// JSON-encoded snapshot from ballooning on long-lived issues. Without these
+// caps a standing/recurring timer wake on an issue with a few hundred comments
+// and dozens of prior runs re-serializes the entire thread on every heartbeat
+// even though nothing changed. The resume-delta path already handles per-run
+// edits; these caps bound the *snapshot* the delta is computed against and
+// the snapshot that lands in fresh-session prompts.
+//
+// Origin comments (the comments that authorized this wake) MUST stay in the
+// published snapshot: a downstream resume delta computes its diff against the
+// prior envelope and must be able to reference the origin row by id, and a
+// fresh-session prompt must surface the originating user request.
+const EXECUTION_CONTINUATION_MAX_MESSAGES = 50;
+const EXECUTION_CONTINUATION_MAX_MESSAGE_BODY_CHARS = 4_000;
+const EXECUTION_CONTINUATION_MAX_TOTAL_MESSAGE_BODY_CHARS = 24_000;
+const EXECUTION_CONTINUATION_MAX_COMPLETED_ACTIONS = 30;
+const EXECUTION_CONTINUATION_MAX_RECOVERY_OUTCOMES = 10;
+const MESSAGE_BODY_TRUNCATION_SUFFIX = "\n[... body truncated for prompt budget ...]";
+
+interface EnvelopeMessage {
+  id: string;
+  authorType: string;
+  authorId: string | null;
+  createdByRunId: string | null;
+  body: string;
+  /** True when the prompt-budget cap truncated the original comment body. */
+  bodyTruncated?: boolean;
+  createdAt: string;
+  updatedAt: string;
+  deleted: boolean;
+  sourceTrust: unknown;
+}
+
+function truncateMessageBody(body: string): {
+  body: string;
+  bodyTruncated: boolean;
+} {
+  if (body.length <= EXECUTION_CONTINUATION_MAX_MESSAGE_BODY_CHARS) {
+    return { body, bodyTruncated: false };
+  }
+  const keep = Math.max(
+    0,
+    EXECUTION_CONTINUATION_MAX_MESSAGE_BODY_CHARS - MESSAGE_BODY_TRUNCATION_SUFFIX.length,
+  );
+  return {
+    body: `${body.slice(0, keep)}${MESSAGE_BODY_TRUNCATION_SUFFIX}`,
+    bodyTruncated: true,
+  };
+}
+
+function capMessagesForEnvelope(input: {
+  messages: EnvelopeMessage[];
+  mustIncludeIds: ReadonlySet<string>;
+}): {
+  messages: EnvelopeMessage[];
+  omittedCount: number;
+  bodyCharsPublished: number;
+  bodyCharBudgetHit: boolean;
+} {
+  const all = input.messages;
+  if (all.length === 0) {
+    return {
+      messages: [],
+      omittedCount: 0,
+      bodyCharsPublished: 0,
+      bodyCharBudgetHit: false,
+    };
+  }
+  // Pass 1: bound every individual message body. Must-include messages (origin
+  // comments) get their own body budget so they cannot dominate the total.
+  const maxMustIncludeBodyChars = Math.min(
+    EXECUTION_CONTINUATION_MAX_TOTAL_MESSAGE_BODY_CHARS,
+    Math.max(
+      EXECUTION_CONTINUATION_MAX_MESSAGE_BODY_CHARS * 2,
+      Math.floor(EXECUTION_CONTINUATION_MAX_TOTAL_MESSAGE_BODY_CHARS / 2),
+    ),
+  );
+  const cappedById = new Map<string, EnvelopeMessage>();
+  let mustIncludeChars = 0;
+  for (const message of all) {
+    if (input.mustIncludeIds.has(message.id)) {
+      if (mustIncludeChars >= maxMustIncludeBodyChars) {
+        cappedById.set(message.id, { ...message, body: "" });
+        continue;
+      }
+      const { body, bodyTruncated } = truncateMessageBody(message.body);
+      if (mustIncludeChars + body.length > maxMustIncludeBodyChars) {
+        const remaining = Math.max(0, maxMustIncludeBodyChars - mustIncludeChars);
+        cappedById.set(message.id, {
+          ...message,
+          body: body.slice(0, remaining) + MESSAGE_BODY_TRUNCATION_SUFFIX,
+          bodyTruncated: true,
+        });
+        mustIncludeChars += remaining + MESSAGE_BODY_TRUNCATION_SUFFIX.length;
+        continue;
+      }
+      mustIncludeChars += body.length;
+      cappedById.set(message.id, bodyTruncated ? { ...message, body, bodyTruncated } : message);
+    } else {
+      const { body, bodyTruncated } = truncateMessageBody(message.body);
+      cappedById.set(message.id, bodyTruncated ? { ...message, body, bodyTruncated } : message);
+    }
+  }
+
+  // Pass 2: select which messages to publish. The published set must include
+  // every must-include id and the most recent tail messages up to the count
+  // and body-char caps. Messages are emitted in their original chronological
+  // order so the envelope remains a faithful history (not a reordered digest).
+  const totalSlots = EXECUTION_CONTINUATION_MAX_MESSAGES;
+  const totalBodyBudget = EXECUTION_CONTINUATION_MAX_TOTAL_MESSAGE_BODY_CHARS;
+  const includedIndexes: number[] = [];
+  let includedChars = 0;
+  let bodyCharBudgetHit = false;
+  let remainingSlots = totalSlots;
+  // Walk backwards from the newest message, prefer must-include first, then
+  // fill remaining slots with non-must-include.
+  for (let i = all.length - 1; i >= 0 && remainingSlots > 0; i--) {
+    const message = all[i]!;
+    const capped = cappedById.get(message.id)!;
+    if (input.mustIncludeIds.has(message.id)) {
+      includedIndexes.push(i);
+      includedChars += capped.body.length;
+      remainingSlots -= 1;
+    }
+  }
+  for (let i = all.length - 1; i >= 0 && remainingSlots > 0; i--) {
+    const message = all[i]!;
+    if (input.mustIncludeIds.has(message.id)) continue;
+    const capped = cappedById.get(message.id)!;
+    if (includedChars + capped.body.length > totalBodyBudget) {
+      const remaining = Math.max(0, totalBodyBudget - includedChars);
+      if (remaining > 0) {
+        includedIndexes.push(i);
+        includedChars += remaining + MESSAGE_BODY_TRUNCATION_SUFFIX.length;
+      }
+      bodyCharBudgetHit = true;
+      break;
+    }
+    includedIndexes.push(i);
+    includedChars += capped.body.length;
+    remainingSlots -= 1;
+  }
+  includedIndexes.sort((a, b) => a - b);
+  const published = includedIndexes.map((index) => cappedById.get(all[index]!.id)!);
+  const omittedCount = Math.max(0, all.length - published.length);
+  return {
+    messages: published,
+    omittedCount,
+    bodyCharsPublished: includedChars,
+    bodyCharBudgetHit,
+  };
+}
 export function continuationOriginCommentIds(context: unknown): string[] {
   const c = object(context);
   const prior = object(c.executionContinuation);
@@ -145,7 +298,7 @@ export async function buildExecutionContinuation(input: {
   // Missing source rows cannot silently become a claim of complete context.
   if (originCommentIds.some((id) => !rows.some((row) => row.id === id)))
     throw new Error("continuation_source_context_missing");
-  const messages = rows.map((row) => {
+  const allMessages: EnvelopeMessage[] = rows.map((row) => {
     const safe = input.exposeLowTrustRaw
       ? row
       : sanitizeQuarantinedCommentForHigherTrust(row);
@@ -163,6 +316,12 @@ export async function buildExecutionContinuation(input: {
       sourceTrust: row.sourceTrust,
     };
   });
+  const mustIncludeIds = new Set(originCommentIds);
+  const capped = capMessagesForEnvelope({
+    messages: allMessages,
+    mustIncludeIds,
+  });
+  const messages = capped.messages;
   const previousRun = input.previousContextRunId
     ? (
         await db
@@ -182,27 +341,41 @@ export async function buildExecutionContinuation(input: {
   const deliveredMessages = Array.isArray(priorEnvelope.messages)
     ? priorEnvelope.messages.map(object)
     : null;
-  const resumeDelta =
+  const resumeDeltaMessages =
     deliveredMessages && input.previousContextRunId
-      ? {
-          baseRunId: input.previousContextRunId,
-          messages: messages.filter(
-            (message) =>
-              originCommentIds.includes(message.id) ||
-              !deliveredMessages.some(
-                (prior) =>
-                  prior.id === message.id &&
-                  prior.updatedAt === message.updatedAt &&
-                  prior.body === message.body &&
-                  prior.deleted === message.deleted &&
-                  prior.authorId === message.authorId &&
-                  (prior.createdByRunId ?? null) === message.createdByRunId &&
-                  JSON.stringify(prior.sourceTrust) ===
-                    JSON.stringify(message.sourceTrust),
-              ),
-          ),
-        }
+      ? allMessages.filter(
+          (message) =>
+            originCommentIds.includes(message.id) ||
+            !deliveredMessages.some(
+              (prior) =>
+                prior.id === message.id &&
+                prior.updatedAt === message.updatedAt &&
+                prior.body === message.body &&
+                prior.deleted === message.deleted &&
+                prior.authorId === message.authorId &&
+                (prior.createdByRunId ?? null) === message.createdByRunId &&
+                JSON.stringify(prior.sourceTrust) ===
+                  JSON.stringify(message.sourceTrust),
+            ),
+        )
       : undefined;
+  // Apply the same per-message and total-body budget to the resume delta.
+  // Origin comments must stay in the delta so a resumed session always sees
+  // its authorizing wake, and edits to delivered messages must still surface;
+  // other messages that aged out of the prior snapshot re-enter as low-cost
+  // references rather than full bodies.
+  const cappedResumeDeltaMessages =
+    resumeDeltaMessages === undefined
+      ? undefined
+      : capMessagesForEnvelope({
+          messages: resumeDeltaMessages,
+          mustIncludeIds: new Set([
+            ...originCommentIds,
+            ...(deliveredMessages ?? []).flatMap((prior) =>
+              originCommentIds.includes(String(prior.id)) ? [String(prior.id)] : [],
+            ),
+          ]),
+        });
   const latestRequest = messages.findLast(
     (row) =>
       row.authorType === "user" && !row.createdByRunId && !row.deleted && row.body.trim().length > 0,
@@ -236,6 +409,15 @@ export async function buildExecutionContinuation(input: {
       },
     ),
   );
+  // Keep the most recent completed actions; older ones have already been
+  // summarized by `completedWork` (the continuation summary document).
+  const completedActionsOmittedCount = Math.max(
+    0,
+    completedActions.length - EXECUTION_CONTINUATION_MAX_COMPLETED_ACTIONS,
+  );
+  const boundedCompletedActions = completedActions.slice(
+    -EXECUTION_CONTINUATION_MAX_COMPLETED_ACTIONS,
+  );
   const reconciliations = await db
     .select({
       id: issueRecoveryActions.id,
@@ -249,14 +431,30 @@ export async function buildExecutionContinuation(input: {
         eq(issueRecoveryActions.status, "resolved"),
       ),
     );
+  const allRecoveryOutcomes = reconciliations
+    .filter((row) => row.evidence.executionReconciliation)
+    .map((row) => ({
+      recoveryActionId: row.id,
+      decision: row.evidence.executionReconciliation,
+    }));
+  const recoveryOutcomesOmittedCount = Math.max(
+    0,
+    allRecoveryOutcomes.length - EXECUTION_CONTINUATION_MAX_RECOVERY_OUTCOMES,
+  );
+  const boundedRecoveryOutcomes = allRecoveryOutcomes.slice(
+    -EXECUTION_CONTINUATION_MAX_RECOVERY_OUTCOMES,
+  );
+
   return {
-    ...(resumeDelta ? { resumeDelta } : {}),
-    recoveryOutcomes: reconciliations
-      .filter((row) => row.evidence.executionReconciliation)
-      .map((row) => ({
-        recoveryActionId: row.id,
-        decision: row.evidence.executionReconciliation,
-      })),
+    ...(resumeDeltaMessages && cappedResumeDeltaMessages
+      ? {
+          resumeDelta: {
+            baseRunId: input.previousContextRunId!,
+            messages: cappedResumeDeltaMessages.messages,
+          },
+        }
+      : {}),
+    recoveryOutcomes: boundedRecoveryOutcomes,
     version: 1,
     companyId,
     issueId,
@@ -277,14 +475,19 @@ export async function buildExecutionContinuation(input: {
         result: row.result,
       })),
     completedWork: input.summary,
-    completedActions,
+    completedActions: boundedCompletedActions,
     unresolvedInteractionIds: interactions
       .filter((row) => row.status === "pending")
       .map((row) => row.id),
     coverage: {
       kind: "full_task_history",
-      throughCommentId: messages.at(-1)?.id ?? null,
+      throughCommentId: allMessages.at(-1)?.id ?? null,
       summaryThroughCommentId: null,
+      omittedMessageCount: capped.omittedCount,
+      bodyCharsPublished: capped.bodyCharsPublished,
+      bodyCharBudgetHit: capped.bodyCharBudgetHit,
+      completedActionsOmittedCount,
+      recoveryOutcomesOmittedCount,
     },
   };
 }

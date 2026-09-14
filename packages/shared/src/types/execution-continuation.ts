@@ -17,6 +17,8 @@ export interface ExecutionContinuationEnvelope {
     /** Run-authored Local CLI comments retain user attribution but are not human direction. */
     createdByRunId?: string | null;
     body: string;
+    /** Set when the prompt-budget cap truncated the original comment body. */
+    bodyTruncated?: boolean;
     createdAt: string;
     updatedAt: string;
     deleted: boolean;
@@ -48,5 +50,16 @@ export interface ExecutionContinuationEnvelope {
     baseRunId?: string;
     throughCommentId: string | null;
     summaryThroughCommentId: null;
+    /**
+     * Snapshot budget metadata. Set on `full_task_history` envelopes. The
+     * resumed-session `task_history_delta` envelope does not need these fields
+     * because the resumed provider session already holds the prior snapshot;
+     * the delta is bounded by edits and new comments.
+     */
+    omittedMessageCount?: number;
+    bodyCharsPublished?: number;
+    bodyCharBudgetHit?: boolean;
+    completedActionsOmittedCount?: number;
+    recoveryOutcomesOmittedCount?: number;
   };
 }
