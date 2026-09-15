@@ -1531,6 +1531,14 @@ async function startServerWithDatabaseTeardown(
           );
         }
 
+        const livenessRepairSweep = await heartbeat.reconcileBlockedNoLivePathLiveness();
+        if (livenessRepairSweep.repaired > 0) {
+          logger.warn(
+            { ...livenessRepairSweep },
+            "startup liveness sweep repaired blocked-no-live-path issues and woke unchanged assignees",
+          );
+        }
+
         const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
         if (taskWatchdogsReconciled.triggered > 0) {
           logger.warn(
@@ -1772,6 +1780,15 @@ async function startServerWithDatabaseTeardown(
               const reconciled = await heartbeat.reconcileResolvedDependencyWakes();
               if (reconciled.healed > 0) {
                 logger.warn({ ...reconciled }, "periodic dependency-wake reconciliation restored task execution paths");
+              }
+            })
+            .then(async () => {
+              const livenessRepairSweep = await heartbeat.reconcileBlockedNoLivePathLiveness();
+              if (livenessRepairSweep.repaired > 0) {
+                logger.warn(
+                  { ...livenessRepairSweep },
+                  "periodic liveness sweep repaired blocked-no-live-path issues and woke unchanged assignees",
+                );
               }
             })
             .then(async () => {

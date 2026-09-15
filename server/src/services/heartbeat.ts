@@ -18638,6 +18638,23 @@ export function heartbeatService(
     return recovery.reconcileResolvedDependencyWakeBackstop(opts);
   }
 
+  async function reconcileBlockedNoLivePathLiveness(opts?: {
+    companyId?: string | null;
+    candidateLimit?: number;
+    source?: string;
+  }) {
+    return recovery.reconcileBlockedNoLivePathLiveness(opts);
+  }
+
+  async function repairBlockedNoLivePathToTodo(input: {
+    companyId: string;
+    issueId: string;
+    source?: string;
+    enqueueWakeupOverride?: typeof enqueueWakeup;
+  }) {
+    return recovery.repairBlockedNoLivePathToTodo(input);
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -27801,6 +27818,9 @@ export function heartbeatService(
     sweepStaleIssueLocks,
 
     reconcileResolvedDependencyWakes,
+
+    reconcileBlockedNoLivePathLiveness,
+    repairBlockedNoLivePathToTodo,
 
     scanSilentActiveRuns,
 

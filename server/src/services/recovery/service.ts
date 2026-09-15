@@ -78,6 +78,9 @@ import {
   terminalizeLegacyExecution,
 } from "../legacy-execution-recovery.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
+import {
+  repairBlockedNoLivePathToTodo,
+} from "./liveness-repair.js";
 import { isExternalChatPresentationContext } from "../heartbeat-run-summary.js";
 import {
   CHAT_CONTROL_RECOVERY_STOP_CODE,
@@ -5417,6 +5420,170 @@ export function recoveryService(
     return result;
   }
 
+  /**
+   * CEO liveness sweep: finds agent-assigned issues that landed in the invalid
+   * `blocked` state without a first-class blocker on file (the gap that
+   * stranded CAN-3457 in [CAN-4073](/CAN/issues/CAN-4073)), transitions them to
+   * `todo`, and wakes the unchanged assignee. Delegates the per-issue decision
+   * to {@link repairBlockedNoLivePathToTodo} so the result is auditable and
+   * deterministic.
+   */
+  async function reconcileBlockedNoLivePathLiveness(opts?: {
+    companyId?: string | null;
+    candidateLimit?: number;
+    source?: string;
+  }) {
+    const result = {
+      checked: 0,
+      repaired: 0,
+      wakeEnqueued: 0,
+      wakeDeferred: 0,
+      noAssignee: 0,
+      notBlocked: 0,
+      liveBlocker: 0,
+      activePathSkipped: 0,
+      interactionSkipped: 0,
+      enqueueFailed: 0,
+      candidateLimitSkipped: 0,
+      issueIds: [] as string[],
+    };
+
+    const candidateLimit = opts?.candidateLimit ?? 200;
+    const source = opts?.source ?? "recovery.liveness_repair_sweep";
+
+    const filters = [
+      eq(issues.status, "blocked"),
+      visibleIssueCondition(),
+      sql`${issues.assigneeAgentId} is not null`,
+    ];
+    if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
+
+    const candidates = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+      })
+      .from(issues)
+      .where(and(...filters))
+      .orderBy(asc(issues.id))
+      .limit(candidateLimit + 1);
+
+    const page = candidates.slice(0, candidateLimit);
+    result.checked = page.length;
+    result.candidateLimitSkipped = Math.max(0, candidates.length - page.length);
+
+    for (const candidate of page) {
+      try {
+        const repair = await invokeRepairBlockedNoLivePathToTodo({
+          companyId: candidate.companyId,
+          issueId: candidate.id,
+          source,
+        });
+        switch (repair.outcome) {
+          case "repaired_and_woke":
+            result.repaired += 1;
+            result.wakeEnqueued += 1;
+            result.issueIds.push(candidate.id);
+            break;
+          case "repaired_wake_deferred":
+            result.repaired += 1;
+            result.wakeDeferred += 1;
+            result.enqueueFailed += 1;
+            result.issueIds.push(candidate.id);
+            break;
+          case "repaired_wake_skipped_no_assignee":
+            result.repaired += 1;
+            result.noAssignee += 1;
+            result.issueIds.push(candidate.id);
+            break;
+          case "not_blocked":
+            result.notBlocked += 1;
+            break;
+          case "has_live_blocker":
+            result.liveBlocker += 1;
+            break;
+          case "active_path_present":
+            result.activePathSkipped += 1;
+            break;
+          case "interaction_pending":
+            result.interactionSkipped += 1;
+            break;
+          case "missing":
+          case "updated":
+            break;
+        }
+      } catch (err) {
+        result.enqueueFailed += 1;
+        logger.warn(
+          { err, issueId: candidate.id, source },
+          "liveness repair action failed",
+        );
+      }
+    }
+
+    if (result.repaired > 0) {
+      logger.warn(
+        {
+          ...result,
+          source,
+        },
+        "liveness sweep repaired blocked-no-live-path issues",
+      );
+    }
+
+    return result;
+  }
+
+  /**
+   * Bound helper that closes over the recovery service's internal helpers
+   * (active-path detection, pending-interaction detection, issue updates, and
+   * the configured `enqueueWakeup` injection). External callers (e.g. the
+   * heartbeat service) should call the exported `repairBlockedNoLivePathToTodo`
+   * wrapper, which routes through this function.
+   */
+  async function invokeRepairBlockedNoLivePathToTodo(input: {
+    companyId: string;
+    issueId: string;
+    source?: string;
+  }) {
+    return repairBlockedNoLivePathToTodo({
+      db,
+      companyId: input.companyId,
+      issueId: input.issueId,
+      enqueueWakeup: deps.enqueueWakeup,
+      hasActiveExecutionPath,
+      hasPendingWakeInteraction,
+      updateIssueStatus: async (issueId, nextStatus) =>
+        issuesSvc.update(issueId, { status: nextStatus }),
+      logActivity: async (entry) => {
+        await logActivity(db, entry);
+      },
+      source: input.source,
+    });
+  }
+
+  async function exposedRepairBlockedNoLivePathToTodo(input: {
+    companyId: string;
+    issueId: string;
+    source?: string;
+    enqueueWakeupOverride?: typeof deps.enqueueWakeup;
+  }) {
+    return repairBlockedNoLivePathToTodo({
+      db,
+      companyId: input.companyId,
+      issueId: input.issueId,
+      enqueueWakeup: input.enqueueWakeupOverride ?? deps.enqueueWakeup,
+      hasActiveExecutionPath,
+      hasPendingWakeInteraction,
+      updateIssueStatus: async (issueId, nextStatus) =>
+        issuesSvc.update(issueId, { status: nextStatus }),
+      logActivity: async (entry) => {
+        await logActivity(db, entry);
+      },
+      source: input.source,
+    });
+  }
+
   function readRecoveryTimerIntervalMs(raw: unknown, fallback: number) {
     return Math.max(1, Math.floor(asNumber(raw, fallback)));
   }
@@ -5820,6 +5987,8 @@ export function recoveryService(
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
     reconcileResolvedDependencyWakeBackstop,
+    reconcileBlockedNoLivePathLiveness,
+    repairBlockedNoLivePathToTodo: exposedRepairBlockedNoLivePathToTodo,
     readRecoveryTimerIntervalMs,
   };
 }
