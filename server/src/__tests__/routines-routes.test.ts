@@ -114,6 +114,7 @@ const mockRoutineService = vi.hoisted(() => ({
   rotateTriggerSecret: vi.fn(),
   runRoutine: vi.fn(),
   firePublicTrigger: vi.fn(),
+  hasEnabledApiTrigger: vi.fn(),
 }));
 
 const mockAnnotationService = vi.hoisted(() => ({
@@ -639,6 +640,178 @@ describe("routine routes", () => {
       agentId: null,
       userId: "board-user",
     });
+  });
+
+  it("allows a same-company agent to fire source=api on a routine they don't own when an enabled API trigger exists", async () => {
+    mockRoutineService.hasEnabledApiTrigger.mockResolvedValue(true);
+    const app = await createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+
+    const res = await request(app)
+      .post(`/api/routines/${routineId}/run`)
+      .send({
+        source: "api",
+        payload: { edge: { kind: "blocker", laneId: "foo" } },
+        idempotencyKey: "edge:foo:2026-09-15T08:00:00Z",
+      });
+
+    expect(res.status).toBe(202);
+    expect(mockRoutineService.hasEnabledApiTrigger).toHaveBeenCalledWith(companyId, routineId);
+    expect(mockRoutineService.runRoutine).toHaveBeenCalledWith(routineId, {
+      source: "api",
+      payload: { edge: { kind: "blocker", laneId: "foo" } },
+      idempotencyKey: "edge:foo:2026-09-15T08:00:00Z",
+    }, {
+      agentId: otherAgentId,
+      userId: null,
+    });
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "routine.run_triggered",
+      entityType: "routine_run",
+      details: expect.objectContaining({
+        authorization: "api_trigger",
+      }),
+    }));
+  });
+
+  it("forbids a same-company agent from firing source=api when the routine has no enabled API trigger", async () => {
+    mockRoutineService.hasEnabledApiTrigger.mockResolvedValue(false);
+    const app = await createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+
+    const res = await request(app)
+      .post(`/api/routines/${routineId}/run`)
+      .send({ source: "api" });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("Agents can only manage routines assigned to themselves");
+    expect(mockRoutineService.hasEnabledApiTrigger).toHaveBeenCalledWith(companyId, routineId);
+    expect(mockRoutineService.runRoutine).not.toHaveBeenCalled();
+  });
+
+  it("does not broaden source=manual authorization to non-owner same-company agents", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+
+    const res = await request(app)
+      .post(`/api/routines/${routineId}/run`)
+      .send({ source: "manual" });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("Agents can only manage routines assigned to themselves");
+    expect(mockRoutineService.hasEnabledApiTrigger).not.toHaveBeenCalled();
+    expect(mockRoutineService.runRoutine).not.toHaveBeenCalled();
+  });
+
+  it("forbids a cross-company agent from firing source=api even with an enabled API trigger on the routine", async () => {
+    mockRoutineService.hasEnabledApiTrigger.mockResolvedValue(true);
+    mockRoutineService.get.mockResolvedValue({
+      ...routine,
+      companyId: "99999999-9999-4999-8999-999999999999",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+
+    const res = await request(app)
+      .post(`/api/routines/${routineId}/run`)
+      .send({ source: "api" });
+
+    expect(res.status).toBe(404);
+    expect(mockRoutineService.hasEnabledApiTrigger).not.toHaveBeenCalled();
+    expect(mockRoutineService.runRoutine).not.toHaveBeenCalled();
+  });
+
+  it("coalesces duplicate idempotency keys from a non-owner same-company agent fire", async () => {
+    mockRoutineService.hasEnabledApiTrigger.mockResolvedValue(true);
+    mockRoutineService.runRoutine
+      .mockResolvedValueOnce({
+        id: "run-1",
+        source: "api",
+        status: "issue_created",
+        coalescedIntoRunId: null,
+      })
+      .mockResolvedValueOnce({
+        id: "run-1",
+        source: "api",
+        status: "coalesced",
+        coalescedIntoRunId: "run-1",
+      });
+    const app = await createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+    const body = {
+      source: "api",
+      payload: { rule: "edge" },
+      idempotencyKey: "edge:foo:stable",
+    };
+
+    const first = await request(app)
+      .post(`/api/routines/${routineId}/run`)
+      .send(body);
+    const second = await request(app)
+      .post(`/api/routines/${routineId}/run`)
+      .send(body);
+
+    expect(first.status).toBe(202);
+    expect(second.status).toBe(202);
+    expect(mockRoutineService.runRoutine).toHaveBeenCalledTimes(2);
+    expect(mockRoutineService.runRoutine.mock.calls[0][1]).toMatchObject({
+      source: "api",
+      payload: { rule: "edge" },
+      idempotencyKey: "edge:foo:stable",
+    });
+    expect(mockRoutineService.runRoutine.mock.calls[1][1]).toMatchObject({
+      source: "api",
+      payload: { rule: "edge" },
+      idempotencyKey: "edge:foo:stable",
+    });
+  });
+
+  it("retains caller-supplied payload and idempotencyKey when firing via the API trigger path", async () => {
+    mockRoutineService.hasEnabledApiTrigger.mockResolvedValue(true);
+    const app = await createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+
+    const payload = {
+      nested: { count: 42, label: "edge" },
+      array: [1, 2, 3],
+      flag: true,
+    };
+
+    const res = await request(app)
+      .post(`/api/routines/${routineId}/run`)
+      .send({
+        source: "api",
+        payload,
+        idempotencyKey: "  spaces-around-key  ",
+      });
+
+    expect(res.status).toBe(202);
+    expect(mockRoutineService.runRoutine).toHaveBeenCalledWith(
+      routineId,
+      expect.objectContaining({
+        source: "api",
+        payload,
+      }),
+      expect.objectContaining({ agentId: otherAgentId }),
+    );
   });
 
   it("allows routine creation when the board user has tasks:assign", async () => {

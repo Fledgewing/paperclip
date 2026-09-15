@@ -2030,6 +2030,22 @@ export function routineService(
     get: getRoutineById,
     getTrigger: getTriggerById,
 
+    hasEnabledApiTrigger: async (companyId: string, routineId: string): Promise<boolean> => {
+      const row = await db
+        .select({ id: routineTriggers.id })
+        .from(routineTriggers)
+        .where(
+          and(
+            eq(routineTriggers.companyId, companyId),
+            eq(routineTriggers.routineId, routineId),
+            eq(routineTriggers.kind, "api"),
+            eq(routineTriggers.enabled, true),
+          ),
+        )
+        .limit(1);
+      return row.length > 0;
+    },
+
     list: async (
       companyId: string,
       filters?: { projectId?: string | null },

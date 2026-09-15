@@ -117,6 +117,29 @@ export function routineRoutes(
     return routine;
   }
 
+  /**
+   * Non-owner agent authorization for source=api fires. Allowed only when:
+   *   - source === "api"
+   *   - the actor is an authenticated agent in the routine's company
+   *   - the routine has at least one enabled API trigger belonging to the
+   *     same company
+   *
+   * Returns true when the agent is authorized, false otherwise. The caller
+   * surfaces the canonical "Agents can only manage routines assigned to
+   * themselves" 403 when this helper returns false, so existing clients
+   * keep seeing a stable error message for non-API cases.
+   */
+  async function hasAuthorizedApiTrigger(
+    req: Request,
+    routine: NonNullable<Awaited<ReturnType<typeof svc.get>>>,
+    source: string | null | undefined,
+  ): Promise<boolean> {
+    if (source !== "api") return false;
+    if (req.actor.type !== "agent" || !req.actor.agentId) return false;
+    if (!hasCompanyAccess(req, routine.companyId)) return false;
+    return svc.hasEnabledApiTrigger(routine.companyId, routine.id);
+  }
+
   async function logRoutineRevisionCreated(req: Request, input: {
     companyId: string;
     routineId: string;
@@ -627,10 +650,38 @@ export function routineRoutes(
   );
 
   router.post("/routines/:id/run", validateIssueMutationBody(runRoutineSchema), async (req, res) => {
-    const routine = await assertCanManageExistingRoutine(req, req.params.id as string);
-    if (!routine) {
-      res.status(404).json({ error: "Routine not found" });
-      return;
+    const requestedSource = (req.body?.source ?? "manual") as string;
+    let routine: Awaited<ReturnType<typeof svc.get>> | null = null;
+    let firedViaApiTriggerAuth = false;
+    if (req.actor.type === "board") {
+      routine = await assertCanManageExistingRoutine(req, req.params.id as string);
+      if (!routine) {
+        res.status(404).json({ error: "Routine not found" });
+        return;
+      }
+    } else if (req.actor.type === "agent" && req.actor.agentId) {
+      const candidate = await svc.get(req.params.id as string);
+      if (!candidate || !hasCompanyAccess(req, candidate.companyId)) {
+        res.status(404).json({ error: "Routine not found" });
+        return;
+      }
+      if (candidate.assigneeAgentId === req.actor.agentId) {
+        // Owner path — keep the original assertCanManageExistingRoutine
+        // semantics for activity logging and downstream consumers.
+        assertCompanyAccess(req, candidate.companyId);
+        routine = candidate;
+      } else if (await hasAuthorizedApiTrigger(req, candidate, requestedSource)) {
+        // Non-owner agent firing an enabled API trigger belonging to the
+        // same company. The owner of any created execution issue stays the
+        // routine assignee; we only relax the *caller* authorization here.
+        assertCompanyAccess(req, candidate.companyId);
+        routine = candidate;
+        firedViaApiTriggerAuth = true;
+      } else {
+        throw forbidden("Agents can only manage routines assigned to themselves");
+      }
+    } else {
+      throw unauthorized();
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
     const run = await svc.runRoutine(routine.id, req.body, {
@@ -648,7 +699,12 @@ export function routineRoutes(
       action: "routine.run_triggered",
       entityType: "routine_run",
       entityId: run.id,
-      details: { routineId: routine.id, source: run.source, status: run.status },
+      details: {
+        routineId: routine.id,
+        source: run.source,
+        status: run.status,
+        authorization: firedViaApiTriggerAuth ? "api_trigger" : "owner",
+      },
     });
     res.status(202).json(run);
   });
