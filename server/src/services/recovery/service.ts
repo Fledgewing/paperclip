@@ -909,6 +909,61 @@ function isRepeatedProductiveContinuationRecovery(
   );
 }
 
+// Returns the subset of `candidateIssueIds` that can be added to
+// `issueId`'s blockedBy set without `syncBlockedByIssueIds` rejecting the
+// write. Mirrors `assertNoBlockingCycles` in services/issues.ts exactly: a
+// candidate forms a cycle iff it is reachable from `issueId` by following the
+// company's existing "blocks" edges (blocker -> blocked). Recovery callers
+// use this to drop cycle-forming healthy children before persisting a
+// blocked-by repair so one inverted edge in the issue graph cannot abort the
+// whole periodic heartbeat recovery pass (CAN-4297).
+export async function dropCycleFormingBlockerIssueIds(
+  db: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    candidateIssueIds: string[];
+  },
+): Promise<string[]> {
+  const candidates = [
+    ...new Set(
+      input.candidateIssueIds.filter((id) => id && id !== input.issueId),
+    ),
+  ];
+  if (candidates.length === 0) return [];
+
+  const rows = await db
+    .select({
+      blockerIssueId: issueRelations.issueId,
+      blockedIssueId: issueRelations.relatedIssueId,
+    })
+    .from(issueRelations)
+    .where(
+      and(
+        eq(issueRelations.companyId, input.companyId),
+        eq(issueRelations.type, "blocks"),
+      ),
+    );
+
+  const adjacency = new Map<string, string[]>();
+  for (const row of rows) {
+    const list = adjacency.get(row.blockerIssueId) ?? [];
+    list.push(row.blockedIssueId);
+    adjacency.set(row.blockerIssueId, list);
+  }
+
+  const reachable = new Set<string>([input.issueId]);
+  const queue = [...(adjacency.get(input.issueId) ?? [])];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (reachable.has(current)) continue;
+    reachable.add(current);
+    queue.push(...(adjacency.get(current) ?? []));
+  }
+
+  return candidates.filter((id) => !reachable.has(id));
+}
+
 export function recoveryService(
   db: Db,
   deps: {
@@ -2874,18 +2929,38 @@ export function recoveryService(
       existingUnresolvedBlockerIssues(issue.companyId, issue.id),
       openChildIssues(issue),
     ]);
+    // Same CAN-4297 shape: a child that already sits (transitively) behind
+    // this issue must not be added as its blocker.
+    const cycleSafeChildIds = await dropCycleFormingBlockerIssueIds(db, {
+      companyId: issue.companyId,
+      issueId: issue.id,
+      candidateIssueIds: openChildren.map((row) => row.id),
+    });
     const blockedByIssueIds = [
       ...new Set([
         ...existingBlockers.map((row) => row.id),
-        ...openChildren.map((row) => row.id),
+        ...cycleSafeChildIds,
       ]),
     ];
     if (blockedByIssueIds.length === 0) return null;
 
-    const updated = await issuesSvc.update(issue.id, {
-      status: "blocked",
-      blockedByIssueIds,
-    });
+    let updated: Awaited<ReturnType<typeof issuesSvc.update>> | null = null;
+    try {
+      updated = await issuesSvc.update(issue.id, {
+        status: "blocked",
+        blockedByIssueIds,
+      });
+    } catch (error) {
+      logger.error(
+        {
+          err: error,
+          issueId: issue.id,
+          companyId: issue.companyId,
+        },
+        "waiting-on-review blocked-by repair rejected; leaving issue untouched",
+      );
+      return null;
+    }
     if (!updated) return null;
 
     const waitingOn = formatIssueLinksForComment([
@@ -3353,127 +3428,185 @@ export function recoveryService(
       issueIds: [] as string[],
     };
     for (const { action, issue } of rows) {
-      const wakePolicy = parseObject(action.wakePolicy);
-      const wakePolicyType = readNonEmptyString(wakePolicy.type);
-      if (
-        wakePolicyType !== "bounded_recovery_owner" &&
-        wakePolicyType !== "bounded_owner_disposition_repair" &&
-        action.ownerType !== "board"
-      ) {
-        continue;
-      }
-
-      if (issue.status === "done" || issue.status === "cancelled") {
-        const resolved = await recoveryActionsSvc.resolveActiveForIssue({
-          companyId: action.companyId,
-          sourceIssueId: action.sourceIssueId,
-          actionId: action.id,
-          status: "resolved",
-          outcome: "restored",
-          resolutionNote: "source_terminal",
-        });
-        if (resolved) {
-          result.resolved += 1;
-          result.issueIds.push(issue.id);
-        }
-        continue;
-      }
-
-      // A queued comment or healthy child cannot establish what the stopped
-      // provider already did. Only execution reconciliation can clear this hold.
-      if (requiresExecutionReconciliation(action.cause)) {
-        result.skipped += 1;
-        continue;
-      }
-
-      const [sourceState, healthyChildren, hasNewSourcePath] =
-        await Promise.all([
-          collectDispositionRepairSourceState(db, { issue }),
-          healthyOpenChildIssues(issue),
-          sourceHasNewPathOutsideRecoveryAction(action),
-        ]);
-      const durablePathRestored =
-        action.ownerType !== "board" && sourceState.hasDurableWaitingPath;
-      if (
-        durablePathRestored ||
-        healthyChildren.length > 0 ||
-        hasNewSourcePath
-      ) {
-        if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
-          const blockerIds = await existingUnresolvedBlockerIssueIds(
-            issue.companyId,
-            issue.id,
-          );
-          await issuesSvc.update(issue.id, {
-            status: "blocked",
-            blockedByIssueIds: [
-              ...new Set([
-                ...blockerIds,
-                ...healthyChildren.map((child) => child.id),
-              ]),
-            ],
-          });
-        }
-        const resolved = await recoveryActionsSvc.resolveActiveForIssue({
-          companyId: action.companyId,
-          sourceIssueId: action.sourceIssueId,
-          actionId: action.id,
-          status: "resolved",
-          outcome: "restored",
-          resolutionNote: durablePathRestored
-            ? `durable_path_restored:${sourceState.durablePathReason ?? "unknown"}`
-            : healthyChildren.length > 0
-              ? "durable_path_restored:healthy_child"
-              : "new_source_execution_path",
-        });
-        if (resolved) {
-          result.resolved += 1;
-          result.issueIds.push(issue.id);
-        }
-        continue;
-      }
-
-      if (wakePolicyType === "bounded_owner_disposition_repair") {
+      try {
+        const wakePolicy = parseObject(action.wakePolicy);
+        const wakePolicyType = readNonEmptyString(wakePolicy.type);
         if (
-          await isAutomaticRecoverySuppressedByPauseHold(
-            db,
-            issue.companyId,
-            issue.id,
-            treeControlSvc,
-          )
+          wakePolicyType !== "bounded_recovery_owner" &&
+          wakePolicyType !== "bounded_owner_disposition_repair" &&
+          action.ownerType !== "board"
         ) {
+          continue;
+        }
+
+        if (issue.status === "done" || issue.status === "cancelled") {
+          const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+            companyId: action.companyId,
+            sourceIssueId: action.sourceIssueId,
+            actionId: action.id,
+            status: "resolved",
+            outcome: "restored",
+            resolutionNote: "source_terminal",
+          });
+          if (resolved) {
+            result.resolved += 1;
+            result.issueIds.push(issue.id);
+          }
+          continue;
+        }
+
+        // A queued comment or healthy child cannot establish what the stopped
+        // provider already did. Only execution reconciliation can clear this hold.
+        if (requiresExecutionReconciliation(action.cause)) {
           result.skipped += 1;
           continue;
         }
 
-        const latestRun = await latestRecoveryActionRun(action);
-        const persistedAttempt = Math.max(
-          action.attemptCount,
-          Math.max(
-            0,
-            Math.floor(asNumber(wakePolicy.attempt, action.attemptCount)),
-          ),
-        );
-        const outcome = await reconcileDispositionRepair(issue, latestRun, {
-          historicalAttemptCount: persistedAttempt,
-        });
-        if (outcome === "queued") {
-          result.requeued += 1;
-          result.issueIds.push(issue.id);
-        } else if (outcome === "escalated") {
-          result.escalated += 1;
-          result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
+        const [sourceState, healthyChildIssues, hasNewSourcePath] =
+          await Promise.all([
+            collectDispositionRepairSourceState(db, { issue }),
+            healthyOpenChildIssues(issue),
+            sourceHasNewPathOutsideRecoveryAction(action),
+          ]);
+        // Block the source only on children that do not already (transitively)
+        // sit downstream of it. A child blocked by the source would turn the
+        // restore into a blocking cycle, `assertNoBlockingCycles` would reject
+        // the write, and the whole periodic recovery pass would abort on every
+        // tick (CAN-4297). An empty filtered set falls through to escalation.
+        let healthyChildren = healthyChildIssues;
+        if (
+          healthyChildren.length > 0 &&
+          !sourceState.hasDurableWaitingPath
+        ) {
+          const cycleSafeChildIds = new Set(
+            await dropCycleFormingBlockerIssueIds(db, {
+              companyId: issue.companyId,
+              issueId: issue.id,
+              candidateIssueIds: healthyChildren.map((child) => child.id),
+            }),
+          );
+          const droppedChildIds = healthyChildren
+            .filter((child) => !cycleSafeChildIds.has(child.id))
+            .map((child) => child.id);
+          if (droppedChildIds.length > 0) {
+            logger.warn(
+              {
+                actionId: action.id,
+                issueId: issue.id,
+                companyId: issue.companyId,
+                droppedChildIds,
+              },
+              "dropped cycle-forming healthy children from blocked-by repair",
+            );
+            healthyChildren = healthyChildren.filter((child) =>
+              cycleSafeChildIds.has(child.id),
+            );
+          }
         }
-        continue;
+        const durablePathRestored =
+          action.ownerType !== "board" && sourceState.hasDurableWaitingPath;
+        if (
+          durablePathRestored ||
+          healthyChildren.length > 0 ||
+          hasNewSourcePath
+        ) {
+          if (
+            healthyChildren.length > 0 &&
+            !sourceState.hasDurableWaitingPath
+          ) {
+            const blockerIds = await existingUnresolvedBlockerIssueIds(
+              issue.companyId,
+              issue.id,
+            );
+            await issuesSvc.update(issue.id, {
+              status: "blocked",
+              blockedByIssueIds: [
+                ...new Set([
+                  ...blockerIds,
+                  ...healthyChildren.map((child) => child.id),
+                ]),
+              ],
+            });
+          }
+          const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+            companyId: action.companyId,
+            sourceIssueId: action.sourceIssueId,
+            actionId: action.id,
+            status: "resolved",
+            outcome: "restored",
+            resolutionNote: durablePathRestored
+              ? `durable_path_restored:${sourceState.durablePathReason ?? "unknown"}`
+              : healthyChildren.length > 0
+                ? "durable_path_restored:healthy_child"
+                : "new_source_execution_path",
+          });
+          if (resolved) {
+            result.resolved += 1;
+            result.issueIds.push(issue.id);
+          }
+          continue;
+        }
+
+        if (wakePolicyType === "bounded_owner_disposition_repair") {
+          if (
+            await isAutomaticRecoverySuppressedByPauseHold(
+              db,
+              issue.companyId,
+              issue.id,
+              treeControlSvc,
+            )
+          ) {
+            result.skipped += 1;
+            continue;
+          }
+
+          const latestRun = await latestRecoveryActionRun(action);
+          const persistedAttempt = Math.max(
+            action.attemptCount,
+            Math.max(
+              0,
+              Math.floor(asNumber(wakePolicy.attempt, action.attemptCount)),
+            ),
+          );
+          const outcome = await reconcileDispositionRepair(
+            issue,
+            latestRun,
+            {
+              historicalAttemptCount: persistedAttempt,
+            },
+          );
+          if (outcome === "queued") {
+            result.requeued += 1;
+            result.issueIds.push(issue.id);
+          } else if (outcome === "escalated") {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+
+        if (action.ownerType === "board") continue;
+
+        // Legacy takeover actions remain readable and resolvable, but recovery no
+        // longer schedules another agent-owned wake for them.
+        result.skipped += 1;
+      } catch (error) {
+        // One malformed issue-graph edge must never take down recovery for the
+        // whole instance: isolate the action, log it, and keep processing the
+        // remaining rows (CAN-4297).
+        result.skipped += 1;
+        logger.error(
+          {
+            err: error,
+            actionId: action.id,
+            sourceIssueId: action.sourceIssueId,
+            companyId: action.companyId,
+          },
+          "active recovery action reconcile failed; skipping action",
+        );
       }
-
-      if (action.ownerType === "board") continue;
-
-      // Legacy takeover actions remain readable and resolvable, but recovery no
-      // longer schedules another agent-owned wake for them.
-      result.skipped += 1;
     }
     return result;
   }
@@ -3770,10 +3903,41 @@ export function recoveryService(
       input.issue.companyId,
       input.issue.id,
     );
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-      blockedByIssueIds: blockerIds,
-    });
+    // Re-syncing the existing unresolved blocker set still runs the cycle
+    // guard, so an already-inverted graph edge can reject this write. Do not
+    // let one bad issue abort the whole stranded pass: fall back to the
+    // status-only escalation and surface the failure (CAN-4297).
+    let updated: Awaited<ReturnType<typeof issuesSvc.update>> | null = null;
+    try {
+      updated = await issuesSvc.update(input.issue.id, {
+        status: "blocked",
+        blockedByIssueIds: blockerIds,
+      });
+    } catch (error) {
+      logger.error(
+        {
+          err: error,
+          issueId: input.issue.id,
+          companyId: input.issue.companyId,
+        },
+        "stranded escalation blocked-by re-sync rejected; falling back to status-only update",
+      );
+      try {
+        updated = await issuesSvc.update(input.issue.id, {
+          status: "blocked",
+        });
+      } catch (fallbackError) {
+        logger.error(
+          {
+            err: fallbackError,
+            issueId: input.issue.id,
+            companyId: input.issue.companyId,
+          },
+          "stranded escalation status-only update failed; leaving issue untouched",
+        );
+        return null;
+      }
+    }
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
     const sourceAssigneePreserved =
@@ -5871,6 +6035,7 @@ export function recoveryService(
     escalateStrandedAssignedIssue,
     recordWatchdogDecision,
     scanSilentActiveRuns,
+    reconcileActiveRecoveryActions,
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
     reconcileResolvedDependencyWakeBackstop,
