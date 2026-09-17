@@ -1155,7 +1155,7 @@ export function routineService(
         updatedAt: issues.updatedAt,
       })
       .from(issues)
-      .innerJoin(
+      .leftJoin(
         heartbeatRuns,
         and(
           eq(heartbeatRuns.id, issues.executionRunId),
@@ -1168,6 +1168,7 @@ export function routineService(
           eq(issues.originKind, "routine_execution"),
           inArray(issues.originId, routineIds),
           inArray(issues.status, OPEN_ISSUE_STATUSES),
+          or(eq(issues.status, "blocked"), isNotNull(heartbeatRuns.id)),
           visibleIssueCondition(),
         ),
       )
@@ -1192,7 +1193,7 @@ export function routineService(
           updatedAt: issues.updatedAt,
         })
         .from(issues)
-        .innerJoin(
+        .leftJoin(
           heartbeatRuns,
           and(
             eq(heartbeatRuns.companyId, issues.companyId),
@@ -1206,6 +1207,7 @@ export function routineService(
             eq(issues.originKind, "routine_execution"),
             inArray(issues.originId, missingRoutineIds),
             inArray(issues.status, OPEN_ISSUE_STATUSES),
+            or(eq(issues.status, "blocked"), isNotNull(heartbeatRuns.id)),
             visibleIssueCondition(),
           ),
         )
@@ -1508,10 +1510,16 @@ export function routineService(
     const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
     const originKind = origin?.kind ?? "routine_execution";
     const originId = origin?.id ?? routine.id;
+    // A `blocked` run issue still owns the duty even though nothing is
+    // currently executing against it (that is the definition of blocked) —
+    // it must count as active without needing a live heartbeat run. Every
+    // other open status (backlog/todo/in_progress/in_review) keeps requiring
+    // a live heartbeat run, so a merely-created-and-never-picked-up issue
+    // still doesn't wedge the routine forever (see: "idle execution issue").
     const executionBoundIssue = await executor
       .select()
       .from(issues)
-      .innerJoin(
+      .leftJoin(
         heartbeatRuns,
         and(
           eq(heartbeatRuns.id, issues.executionRunId),
@@ -1524,6 +1532,7 @@ export function routineService(
           eq(issues.originKind, originKind),
           eq(issues.originId, originId),
           inArray(issues.status, OPEN_ISSUE_STATUSES),
+          or(eq(issues.status, "blocked"), isNotNull(heartbeatRuns.id)),
           visibleIssueCondition(),
           ...(fingerprintCondition ? [fingerprintCondition] : []),
         ),
@@ -1536,7 +1545,7 @@ export function routineService(
     return executor
       .select()
       .from(issues)
-      .innerJoin(
+      .leftJoin(
         heartbeatRuns,
         and(
           eq(heartbeatRuns.companyId, issues.companyId),
@@ -1550,6 +1559,7 @@ export function routineService(
           eq(issues.originKind, originKind),
           eq(issues.originId, originId),
           inArray(issues.status, OPEN_ISSUE_STATUSES),
+          or(eq(issues.status, "blocked"), isNotNull(heartbeatRuns.id)),
           visibleIssueCondition(),
           ...(fingerprintCondition ? [fingerprintCondition] : []),
         ),
