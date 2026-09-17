@@ -698,7 +698,9 @@ const MAX_INLINE_WAKE_ATTACHMENTS = 20;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS = 12_000;
+const MAX_TASK_MARKDOWN_DESCRIPTION_CHARS = 12_000;
 const MAX_AGENT_SESSION_MESSAGE_CHARS = 12_000;
+const MAX_AGENT_SESSION_MESSAGE_CHARS_TOOL_ACTION_REVIEW = 2_000;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -4270,13 +4272,20 @@ function parseNativeSessionGoalControl(
   };
 }
 
-function sanitizeAgentSessionMessageText(value: unknown): string | null {
+function agentSessionMessageCharLimit(source: string | null): number {
+  return source === "tool_action_review"
+    ? MAX_AGENT_SESSION_MESSAGE_CHARS_TOOL_ACTION_REVIEW
+    : MAX_AGENT_SESSION_MESSAGE_CHARS;
+}
+
+function sanitizeAgentSessionMessageText(
+  value: unknown,
+  source: string | null = null,
+): string | null {
   const text = readNonEmptyString(value);
   if (!text) return null;
-  const redacted = redactSensitiveText(text).slice(
-    0,
-    MAX_AGENT_SESSION_MESSAGE_CHARS,
-  );
+  const limit = agentSessionMessageCharLimit(source);
+  const redacted = redactSensitiveText(text).slice(0, limit);
   return redacted.trim().length > 0 ? redacted : null;
 }
 
@@ -7456,6 +7465,15 @@ export async function buildPaperclipWakePayload(input: {
   // Experimental: agents write user-interaction content in ASD-STE100
   // Simplified Technical English (rendered as a prompt directive downstream).
   simplifiedEnglishInteractions?: boolean;
+  /**
+   * Optional pre-loaded issue comments for the same companyId+issueId.
+   * When provided, buildPaperclipWakePayload skips its own comment fetch and
+   * filters this set to the wake comment ids. Used by heartbeat dispatch to
+   * share a single issueComments fetch with buildExecutionContinuation.
+   */
+  prefetchedIssueComments?:
+    | ReadonlyArray<typeof issueComments.$inferSelect>
+    | null;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
   const commentIds = extractWakeCommentIds(input.contextSnapshot);
@@ -7467,7 +7485,11 @@ export async function buildPaperclipWakePayload(input: {
   const agentMessage = parseObject(
     input.contextSnapshot[PAPERCLIP_AGENT_MESSAGE_KEY],
   );
-  const agentMessageText = sanitizeAgentSessionMessageText(agentMessage.text);
+  const agentMessageSource = readNonEmptyString(agentMessage.source);
+  const agentMessageText = sanitizeAgentSessionMessageText(
+    agentMessage.text,
+    agentMessageSource,
+  );
   const issueSummary =
     input.issueSummary ??
     (issueId
@@ -7498,7 +7520,12 @@ export async function buildPaperclipWakePayload(input: {
   const commentRows =
     commentIds.length === 0
       ? []
-      : await input.db
+      : input.prefetchedIssueComments
+        ? input.prefetchedIssueComments.filter((row) => {
+            if (issueId && row.issueId !== issueId) return false;
+            return commentIds.includes(row.id);
+          })
+        : await input.db
           .select({
             id: issueComments.id,
             issueId: issueComments.issueId,
@@ -7876,7 +7903,7 @@ export async function buildPaperclipWakePayload(input: {
     agentMessage: agentMessageText
       ? {
           text: agentMessageText,
-          source: readNonEmptyString(agentMessage.source),
+          source: agentMessageSource,
           pluginKey: readNonEmptyString(agentMessage.pluginKey),
           sessionId: readNonEmptyString(agentMessage.sessionId),
           ...(Array.isArray(agentMessage.untrustedToolResults)
@@ -7889,15 +7916,25 @@ export async function buildPaperclipWakePayload(input: {
                       actionRequestId:
                         sanitizeAgentSessionMessageText(
                           result.actionRequestId,
+                          agentMessageSource,
                         ) ?? "",
                       toolName:
-                        sanitizeAgentSessionMessageText(result.toolName) ?? "",
+                        sanitizeAgentSessionMessageText(
+                          result.toolName,
+                          agentMessageSource,
+                        ) ?? "",
                       resultSummary:
-                        sanitizeAgentSessionMessageText(result.resultSummary) ??
-                        "",
-                      error: sanitizeAgentSessionMessageText(result.error),
+                        sanitizeAgentSessionMessageText(
+                          result.resultSummary,
+                          agentMessageSource,
+                        ) ?? "",
+                      error: sanitizeAgentSessionMessageText(
+                        result.error,
+                        agentMessageSource,
+                      ),
                       declineReason: sanitizeAgentSessionMessageText(
                         result.declineReason,
+                        agentMessageSource,
                       ),
                     };
                   }),
@@ -8495,10 +8532,20 @@ export function buildPaperclipTaskMarkdown(input: {
         `- Approved plan:${revisionNumber} ${input.acceptedPlan.revisionId}${documentId}. Follow this exact revision, not a later draft.`,
       );
     }
-    const description =
+    const rawDescription =
       input.includeDescription === false ? "" : issue.description?.trim();
-    if (description) {
+    if (rawDescription) {
+      const descriptionTruncated =
+        rawDescription.length > MAX_TASK_MARKDOWN_DESCRIPTION_CHARS;
+      const description = descriptionTruncated
+        ? rawDescription.slice(0, MAX_TASK_MARKDOWN_DESCRIPTION_CHARS)
+        : rawDescription;
       lines.push("", "Issue description:", fenceTaskText(description));
+      if (descriptionTruncated) {
+        lines.push(
+          `[Issue description truncated at ${MAX_TASK_MARKDOWN_DESCRIPTION_CHARS} chars; the remainder is on the issue page and will not be re-sent this run.]`,
+        );
+      }
     }
   }
   if (ancestors.length > 0) {
@@ -19580,6 +19627,18 @@ export function heartbeatService(
       } else {
         delete context.paperclipSkillTest;
       }
+      const prefetchedIssueComments = issueRef
+        ? await db
+            .select()
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.companyId, agent.companyId),
+                eq(issueComments.issueId, issueRef.id),
+              ),
+            )
+            .orderBy(asc(issueComments.createdAt), asc(issueComments.id))
+        : null;
       const executionContinuation =
         issueRef && issueContext?.assigneeAgentId === agent.id
           ? await buildExecutionContinuation({
@@ -19591,6 +19650,7 @@ export function heartbeatService(
               previousContextRunId: taskSession?.lastRunId,
               summary: safeContinuationSummary?.body ?? null,
               exposeLowTrustRaw,
+              prefetchedIssueComments,
             })
           : null;
       context.executionContinuation = executionContinuation;
@@ -19618,6 +19678,7 @@ export function heartbeatService(
         simplifiedEnglishInteractions:
           experimentalInstanceSettings.enableSimplifiedEnglishInteractions ===
           true,
+        prefetchedIssueComments,
       });
       if (paperclipWakePayload) {
         context[PAPERCLIP_WAKE_PAYLOAD_KEY] = paperclipWakePayload;
