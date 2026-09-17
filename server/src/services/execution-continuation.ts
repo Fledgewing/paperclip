@@ -227,6 +227,13 @@ export async function buildExecutionContinuation(input: {
   previousContextRunId?: string | null;
   summary: string | null;
   exposeLowTrustRaw: boolean;
+  /**
+   * Optional pre-loaded issue comments for the same companyId+issueId,
+   * ordered by createdAt ascending. When provided, buildExecutionContinuation
+   * skips its own issueComments fetch. Used by heartbeat dispatch to share a
+   * single issueComments fetch with buildPaperclipWakePayload.
+   */
+  prefetchedIssueComments?: ReadonlyArray<typeof issueComments.$inferSelect> | null;
 }): Promise<ExecutionContinuationEnvelope> {
   const { db, companyId, issueId } = input;
   const [issue] = await db
@@ -239,16 +246,18 @@ export async function buildExecutionContinuation(input: {
     ["done", "cancelled"].includes(issue.status)
   )
     throw new Error("continuation_task_ownership_changed");
-  const rows = await db
-    .select()
-    .from(issueComments)
-    .where(
-      and(
-        eq(issueComments.companyId, companyId),
-        eq(issueComments.issueId, issueId),
-      ),
-    )
-    .orderBy(asc(issueComments.createdAt), asc(issueComments.id));
+  const rows =
+    input.prefetchedIssueComments ??
+    (await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, companyId),
+          eq(issueComments.issueId, issueId),
+        ),
+      )
+      .orderBy(asc(issueComments.createdAt), asc(issueComments.id)));
   const interactions = await db
     .select()
     .from(issueThreadInteractions)
