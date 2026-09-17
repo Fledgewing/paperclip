@@ -303,6 +303,64 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(watchdog?.triggerCount).toBe(2);
   });
 
+  it("CAN-4501: inherits the watched issue's current assignee, not the watchdog's fixed registrant", async () => {
+    const companyId = await seedCompany();
+    const rveAgentId = await seedAgent(companyId, { name: "RVE" });
+    const laneAgentId = await seedAgent(companyId, { name: "Implementation Lane" });
+    const sourceId = await seedIssue(companyId, {
+      identifier: "WDOG-4501",
+      status: "done",
+      assigneeAgentId: laneAgentId,
+    });
+    // The watchdog registration's own agentId is RVE — this is the fixed
+    // registrant the pre-fix code always fell back to.
+    await seedWatchdog(companyId, sourceId, rveAgentId);
+    const { service } = createService();
+
+    const first = await service.reconcileTaskWatchdogs({ companyId });
+    expect(first).toMatchObject({ checked: 1, triggered: 1 });
+
+    const [firstWatchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    const watchdogIssueId = firstWatchdog!.watchdogIssueId!;
+    const [createdReview] = await db.select().from(issues).where(eq(issues.id, watchdogIssueId));
+    expect(createdReview).toMatchObject({ assigneeAgentId: laneAgentId });
+
+    // Simulate the CAN-4325 re-fire: the review issue lands (terminal status)
+    // while the watched issue stays on the lane. A re-fire must reopen the
+    // review issue back onto the lane, never onto the watchdog's RVE
+    // registrant.
+    await db
+      .update(issues)
+      .set({
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        executionState: null,
+        monitorNextCheckAt: null,
+      })
+      .where(eq(issues.id, watchdogIssueId));
+
+    const second = await service.reconcileTaskWatchdogs({ companyId });
+    expect(second).toMatchObject({ checked: 1, triggered: 1 });
+
+    const [reopenedReview] = await db.select().from(issues).where(eq(issues.id, watchdogIssueId));
+    expect(reopenedReview).toMatchObject({ status: "todo", assigneeAgentId: laneAgentId });
+  });
+
+  it("CAN-4501: falls back to the watchdog's registrant when the watched issue has no assignee", async () => {
+    const companyId = await seedCompany();
+    const rveAgentId = await seedAgent(companyId, { name: "RVE" });
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-4501-UNASSIGNED", status: "done" });
+    await seedWatchdog(companyId, sourceId, rveAgentId);
+    const { service } = createService();
+
+    await service.reconcileTaskWatchdogs({ companyId });
+
+    const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    const [review] = await db.select().from(issues).where(eq(issues.id, watchdog!.watchdogIssueId!));
+    expect(review).toMatchObject({ assigneeAgentId: rveAgentId });
+  });
+
   it("does not trigger while a non-watchdog descendant has live work", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-2", status: "in_progress" });

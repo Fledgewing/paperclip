@@ -1326,6 +1326,15 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     classification: Extract<TaskWatchdogClassifierResult, { state: "stopped" }>;
     runId?: string | null;
   }) {
+    // CAN-4501: resolve the review issue's assignee from the watched issue's
+    // *current* assignee at fire time, not the watchdog registration's fixed
+    // watchdogAgentId (which is RVE for most standing watchdogs). Falling back
+    // to watchdogAgentId only when the watched issue itself has no assignee
+    // keeps a genuinely RVE-owned source issue routed to RVE. Re-resolving on
+    // every fire (including a reopen) is idempotent: it is a pure function of
+    // the watched issue's current state, so a re-fire never overwrites a
+    // human/CEO reassignment of the watched issue with a stale value.
+    const resolvedAssigneeAgentId = input.sourceIssue.assigneeAgentId ?? input.watchdog.watchdogAgentId;
     const existing = input.watchdog.watchdogIssueId
       ? await db
         .select()
@@ -1346,7 +1355,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       const watchdogIssue = shouldReopen
         ? await issuesSvc.update(fallback.id, {
           status: "todo",
-          assigneeAgentId: input.watchdog.watchdogAgentId,
+          assigneeAgentId: resolvedAssigneeAgentId,
           parentId: input.sourceIssue.id,
           projectId: input.sourceIssue.projectId,
           goalId: input.sourceIssue.goalId,
@@ -1399,7 +1408,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         parentId: input.sourceIssue.id,
         projectId: input.sourceIssue.projectId,
         goalId: input.sourceIssue.goalId,
-        assigneeAgentId: input.watchdog.watchdogAgentId,
+        assigneeAgentId: resolvedAssigneeAgentId,
         originKind: TASK_WATCHDOG_ORIGIN_KIND,
         originId: input.sourceIssue.id,
         originFingerprint: input.classification.stopFingerprint,
