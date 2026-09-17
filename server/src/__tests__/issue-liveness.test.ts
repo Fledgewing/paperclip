@@ -627,4 +627,355 @@ describe("issue graph liveness classifier", () => {
       recoveryIssueId: reviewIssueId,
     });
   });
+
+  describe("parked-by-design suppression (CAN-3937 / CAN-3938)", () => {
+    const now = new Date("2026-09-14T18:00:00.000Z");
+    const oneDayMs = 24 * 60 * 60 * 1000;
+    const sixDaysAgo = new Date(now.getTime() - 6 * oneDayMs);
+    const eightDaysAgo = new Date(now.getTime() - 8 * oneDayMs);
+    const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+    const inTenMinutes = new Date(now.getTime() + 10 * 60 * 1000);
+
+    const backlogBlockerId = "parked-blocker";
+    const blockerAgentId = "blocker-agent";
+    const otherAgentId = "other-agent";
+
+    function backlogBlocker(overrides: Record<string, unknown> = {}) {
+      return issue({
+        id: backlogBlockerId,
+        identifier: "PAP-3938",
+        title: "Parked by design blocker",
+        status: "backlog",
+        assigneeAgentId: blockerAgentId,
+        ...overrides,
+      });
+    }
+
+    function blockedSource(overrides: Record<string, unknown> = {}) {
+      return issue({
+        id: "blocked-source",
+        identifier: "PAP-3938-SRC",
+        title: "Downstream work",
+        status: "blocked",
+        ...overrides,
+      });
+    }
+
+    function allAgents() {
+      return [
+        agent(),
+        manager,
+        agent({ id: blockerAgentId, name: "Blocker Agent", reportsTo: managerId }),
+        agent({ id: otherAgentId, name: "Other Agent", reportsTo: managerId }),
+      ];
+    }
+
+    const baseRelations = [
+      { companyId, blockerIssueId: backlogBlockerId, blockedIssueId: "blocked-source" },
+    ];
+
+    it("suppresses the finding when the current assignee authored a parked-by-design comment within 7 days", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [blockedSource(), backlogBlocker()],
+        relations: baseRelations,
+        agents: allAgents(),
+        now,
+        recentCommentsByIssueId: [
+          {
+            id: "c1",
+            issueId: backlogBlockerId,
+            companyId,
+            authorAgentId: blockerAgentId,
+            authorUserId: null,
+            body: "Status note: parked-by-design while upstream is settled.",
+            createdAt: oneHourAgo,
+          },
+        ],
+      });
+
+      expect(findings).toEqual([]);
+    });
+
+    it("suppresses when the comment uses the alternative phrase 'intentional parked log'", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [blockedSource(), backlogBlocker()],
+        relations: baseRelations,
+        agents: allAgents(),
+        now,
+        recentCommentsByIssueId: [
+          {
+            id: "c1",
+            issueId: backlogBlockerId,
+            companyId,
+            authorAgentId: blockerAgentId,
+            authorUserId: null,
+            body: "Marking this an intentional parked log — wake me when the design lands.",
+            createdAt: oneHourAgo,
+          },
+        ],
+      });
+
+      expect(findings).toEqual([]);
+    });
+
+    it("treats the phrase matching as case-insensitive", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [blockedSource(), backlogBlocker()],
+        relations: baseRelations,
+        agents: allAgents(),
+        now,
+        recentCommentsByIssueId: [
+          {
+            id: "c1",
+            issueId: backlogBlockerId,
+            companyId,
+            authorAgentId: blockerAgentId,
+            authorUserId: null,
+            body: "PARKED-BY-DESIGN — leaving this quiet until the upstream issue resolves.",
+            createdAt: oneHourAgo,
+          },
+        ],
+      });
+
+      expect(findings).toEqual([]);
+    });
+
+    it("does not suppress when the suppressing comment is older than 7 days", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [blockedSource(), backlogBlocker()],
+        relations: baseRelations,
+        agents: allAgents(),
+        now,
+        recentCommentsByIssueId: [
+          {
+            id: "c1",
+            issueId: backlogBlockerId,
+            companyId,
+            authorAgentId: blockerAgentId,
+            authorUserId: null,
+            body: "Old parked-by-design note from a week ago.",
+            createdAt: eightDaysAgo,
+          },
+        ],
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({
+        state: "blocked_by_assigned_backlog_issue",
+        recoveryIssueId: backlogBlockerId,
+      });
+    });
+
+    it("ends suppression when a later comment is authored by another agent", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [blockedSource(), backlogBlocker()],
+        relations: baseRelations,
+        agents: allAgents(),
+        now,
+        recentCommentsByIssueId: [
+          {
+            id: "c1",
+            issueId: backlogBlockerId,
+            companyId,
+            authorAgentId: blockerAgentId,
+            authorUserId: null,
+            body: "parked-by-design for now",
+            createdAt: sixDaysAgo,
+          },
+          {
+            id: "c2",
+            issueId: backlogBlockerId,
+            companyId,
+            authorAgentId: otherAgentId,
+            authorUserId: null,
+            body: "Can you give this a quick look today?",
+            createdAt: oneHourAgo,
+          },
+        ],
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({
+        state: "blocked_by_assigned_backlog_issue",
+        recoveryIssueId: backlogBlockerId,
+      });
+    });
+
+    it("ends suppression when a later comment is authored by a user (board member)", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [blockedSource(), backlogBlocker()],
+        relations: baseRelations,
+        agents: allAgents(),
+        now,
+        recentCommentsByIssueId: [
+          {
+            id: "c1",
+            issueId: backlogBlockerId,
+            companyId,
+            authorAgentId: blockerAgentId,
+            authorUserId: null,
+            body: "parked-by-design",
+            createdAt: sixDaysAgo,
+          },
+          {
+            id: "c2",
+            issueId: backlogBlockerId,
+            companyId,
+            authorAgentId: null,
+            authorUserId: "board-user-1",
+            body: "Please nudge this forward when you have a moment.",
+            createdAt: oneHourAgo,
+          },
+        ],
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({
+        state: "blocked_by_assigned_backlog_issue",
+        recoveryIssueId: backlogBlockerId,
+      });
+    });
+
+    it("ends suppression when the issue is reassigned to a different agent", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          blockedSource(),
+          backlogBlocker({ assigneeAgentId: otherAgentId }),
+        ],
+        relations: baseRelations,
+        agents: allAgents(),
+        now,
+        recentCommentsByIssueId: [
+          {
+            id: "c1",
+            issueId: backlogBlockerId,
+            companyId,
+            authorAgentId: blockerAgentId,
+            authorUserId: null,
+            body: "parked-by-design",
+            createdAt: oneHourAgo,
+          },
+        ],
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({
+        state: "blocked_by_assigned_backlog_issue",
+        recoveryIssueId: backlogBlockerId,
+        recommendedOwnerAgentId: otherAgentId,
+      });
+    });
+
+    it("does not suppress when the blocker has been promoted out of backlog to todo", () => {
+      // The finding only emits for backlog blockers; promotion to `todo`
+      // naturally turns off the alarm because the rule's branch is
+      // unreachable. We assert that the parked-by-design marker is no
+      // longer needed and the rule continues to flag anything that does
+      // match the new state.
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          blockedSource(),
+          backlogBlocker({ status: "todo" }),
+        ],
+        relations: baseRelations,
+        agents: allAgents(),
+        now,
+        recentCommentsByIssueId: [
+          {
+            id: "c1",
+            issueId: backlogBlockerId,
+            companyId,
+            authorAgentId: blockerAgentId,
+            authorUserId: null,
+            body: "parked-by-design",
+            createdAt: oneHourAgo,
+          },
+        ],
+      });
+
+      expect(findings).toEqual([]);
+    });
+
+    it("ends suppression when a priority change occurred after the suppressing comment", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          blockedSource(),
+          backlogBlocker({ priorityChangedAt: inTenMinutes }),
+        ],
+        relations: baseRelations,
+        agents: allAgents(),
+        now,
+        recentCommentsByIssueId: [
+          {
+            id: "c1",
+            issueId: backlogBlockerId,
+            companyId,
+            authorAgentId: blockerAgentId,
+            authorUserId: null,
+            body: "parked-by-design",
+            createdAt: oneHourAgo,
+          },
+        ],
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({
+        state: "blocked_by_assigned_backlog_issue",
+        recoveryIssueId: backlogBlockerId,
+      });
+    });
+
+    it("does not suppress on unrelated comments (no suppression phrase in the body)", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [blockedSource(), backlogBlocker()],
+        relations: baseRelations,
+        agents: allAgents(),
+        now,
+        recentCommentsByIssueId: [
+          {
+            id: "c1",
+            issueId: backlogBlockerId,
+            companyId,
+            authorAgentId: blockerAgentId,
+            authorUserId: null,
+            body: "Looking at the upstream design today — not blocked.",
+            createdAt: oneHourAgo,
+          },
+          {
+            id: "c2",
+            issueId: backlogBlockerId,
+            companyId,
+            authorAgentId: otherAgentId,
+            authorUserId: null,
+            body: "Acknowledged, thanks for the heads up.",
+            createdAt: sixDaysAgo,
+          },
+        ],
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({
+        state: "blocked_by_assigned_backlog_issue",
+        recoveryIssueId: backlogBlockerId,
+      });
+    });
+
+    it("preserves the existing alarm when the caller omits recent-comment context entirely", () => {
+      // No recentCommentsByIssueId at all — the rule must continue to
+      // fire normally so backward-compatible callers do not silently
+      // lose the alarm.
+      const findings = classifyIssueGraphLiveness({
+        issues: [blockedSource(), backlogBlocker()],
+        relations: baseRelations,
+        agents: allAgents(),
+        now,
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({
+        state: "blocked_by_assigned_backlog_issue",
+        recoveryIssueId: backlogBlockerId,
+      });
+    });
+  });
 });
