@@ -4,6 +4,7 @@ export {
 export type {
   IssueGraphLivenessInput,
   IssueLivenessAgentInput,
+  IssueLivenessCommentInput,
   IssueLivenessDependencyPathEntry,
   IssueLivenessExecutionPathInput,
   IssueLivenessFinding,

@@ -28,6 +28,7 @@ export interface IssueLivenessIssueInput {
   executionState?: Record<string, unknown> | null;
   monitorNextCheckAt?: Date | string | null;
   monitorAttemptCount?: number | null;
+  priorityChangedAt?: Date | string | null;
 }
 
 export interface IssueLivenessRelationInput {
@@ -61,6 +62,16 @@ export interface IssueLivenessWaitingPathInput {
   issueId: string;
   status: string;
   createdAt?: Date | string | null;
+}
+
+export interface IssueLivenessCommentInput {
+  id?: string | null;
+  companyId?: string | null;
+  issueId: string;
+  authorAgentId?: string | null;
+  authorUserId?: string | null;
+  body: string;
+  createdAt: Date | string;
 }
 
 export type IssueReviewPathFactKind =
@@ -126,6 +137,16 @@ export interface IssueGraphLivenessInput {
   pendingInteractions?: IssueLivenessWaitingPathInput[];
   pendingApprovals?: IssueLivenessWaitingPathInput[];
   openRecoveryIssues?: IssueLivenessWaitingPathInput[];
+  /**
+   * Recent comments per issue (already-fetched context). When the caller
+   * (e.g. the Ops Sentinel liveness sweep) already has the recent comment
+   * thread in memory, it can pass it here to suppress the
+   * `blocked_by_assigned_backlog_issue` finding on parked-by-design
+   * issues. Callers without comment context should leave this undefined —
+   * suppression never fires without recent-comment context, so an absent
+   * field is the safe backward-compatible default.
+   */
+  recentCommentsByIssueId?: IssueLivenessCommentInput[];
   now?: Date | string;
 }
 
@@ -166,6 +187,98 @@ function hasWaitingPath(
   waitingPaths: IssueLivenessWaitingPathInput[],
 ) {
   return waitingPaths.some((entry) => entry.companyId === companyId && entry.issueId === issueId);
+}
+
+/**
+ * Suppression phrases for the parked-by-design liveness rule. Match is
+ * case-insensitive substring against the comment body. Both phrases are
+ * accepted because the standing-log and recut-task communities have used
+ * each in the wild; the rule is meant to read either flag as the same
+ * "this is intentional" signal.
+ */
+const PARKED_BY_DESIGN_PHRASES = ["parked-by-design", "intentional parked log"] as const;
+
+const PARKED_BY_DESIGN_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * True when the issue is parked-by-design and the liveness alarm should
+ * stay silent. The rule reads only inputs the caller already has in
+ * scope (recent comments + the issue's own timestamps), so no schema
+ * change is required.
+ *
+ * Conditions (per CAN-3937 / CAN-3938):
+ *   1. The current assignee authored a comment within the preceding
+ *      7 days whose body contains either suppression phrase
+ *      (case-insensitive).
+ *   2. The issue status is still parked/backlog (otherwise the rule
+ *      would not fire anyway — this is a defensive guard).
+ *   3. The current assignee is unchanged from the comment's author
+ *      (an assignee change implicitly ends suppression).
+ *   4. No later comment by another agent or user exists on the issue
+ *      (a follow-up by anyone else is a real signal).
+ *   5. No priority change occurred after the suppressing comment
+ *      (the caller passes priorityChangedAt — `null`/undefined means
+ *      "no change detected"; a value earlier than the suppressor is
+ *      also a no-op).
+ *
+ * When any condition fails, suppression is off and the liveness alarm
+ * emits normally.
+ */
+function isIssueParkedByDesign(
+  issue: IssueLivenessIssueInput,
+  recentCommentsByIssueId: IssueLivenessCommentInput[] | undefined,
+  nowMs: number,
+): boolean {
+  if (issue.status !== "backlog") return false;
+  if (!issue.assigneeAgentId && !issue.assigneeUserId) return false;
+  if (!recentCommentsByIssueId || recentCommentsByIssueId.length === 0) return false;
+
+  const cutoff = nowMs - PARKED_BY_DESIGN_LOOKBACK_MS;
+  let suppressor: IssueLivenessCommentInput | null = null;
+  let suppressorMs = -1;
+
+  for (const comment of recentCommentsByIssueId) {
+    if (!comment || comment.issueId !== issue.id) continue;
+    if (comment.companyId && comment.companyId !== issue.companyId) continue;
+    const createdAtMs = readDateMs(comment.createdAt);
+    if (createdAtMs === null || createdAtMs < cutoff) continue;
+
+    const authorMatchesAgent = Boolean(
+      issue.assigneeAgentId && comment.authorAgentId === issue.assigneeAgentId,
+    );
+    const authorMatchesUser = Boolean(
+      issue.assigneeUserId && comment.authorUserId === issue.assigneeUserId,
+    );
+    if (!authorMatchesAgent && !authorMatchesUser) continue;
+
+    const body = (comment.body ?? "").toLowerCase();
+    if (!PARKED_BY_DESIGN_PHRASES.some((phrase) => body.includes(phrase))) continue;
+
+    if (createdAtMs > suppressorMs) {
+      suppressor = comment;
+      suppressorMs = createdAtMs;
+    }
+  }
+
+  if (!suppressor || suppressorMs < 0) return false;
+
+  const priorityChangedMs = readDateMs(issue.priorityChangedAt ?? null);
+  if (priorityChangedMs !== null && priorityChangedMs > suppressorMs) return false;
+
+  for (const comment of recentCommentsByIssueId) {
+    if (!comment || comment.issueId !== issue.id) continue;
+    if (comment.companyId && comment.companyId !== issue.companyId) continue;
+    const createdAtMs = readDateMs(comment.createdAt);
+    if (createdAtMs === null || createdAtMs <= suppressorMs) continue;
+    const sameAuthor =
+      (issue.assigneeAgentId !== null &&
+        comment.authorAgentId === issue.assigneeAgentId) ||
+      (issue.assigneeUserId !== null && comment.authorUserId === issue.assigneeUserId);
+    if (sameAuthor) continue;
+    return false;
+  }
+
+  return true;
 }
 
 function readRecord(value: unknown): Record<string, unknown> | null {
@@ -480,6 +593,22 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   const pendingInteractions = input.pendingInteractions ?? [];
   const pendingApprovals = input.pendingApprovals ?? [];
   const openRecoveryIssues = input.openRecoveryIssues ?? [];
+  const recentComments = input.recentCommentsByIssueId;
+  const recentCommentsByIssueId = new Map<string, IssueLivenessCommentInput[]>();
+  if (recentComments && recentComments.length > 0) {
+    for (const comment of recentComments) {
+      if (!comment || !comment.issueId) continue;
+      if (comment.companyId && comment.companyId !== issuesById.get(comment.issueId)?.companyId) {
+        const list = recentCommentsByIssueId.get(comment.issueId) ?? [];
+        list.push(comment);
+        recentCommentsByIssueId.set(comment.issueId, list);
+        continue;
+      }
+      const list = recentCommentsByIssueId.get(comment.issueId) ?? [];
+      list.push(comment);
+      recentCommentsByIssueId.set(comment.issueId, list);
+    }
+  }
 
   for (const relation of input.relations) {
     const list = blockersByBlockedIssueId.get(relation.blockedIssueId) ?? [];
@@ -620,6 +749,9 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     }
 
     if (blocker.status === "backlog" && blocker.assigneeAgentId) {
+      if (isIssueParkedByDesign(blocker, recentCommentsByIssueId.get(blocker.id), nowMs)) {
+        return null;
+      }
       return finding({
         issue: source,
         state: "blocked_by_assigned_backlog_issue",
