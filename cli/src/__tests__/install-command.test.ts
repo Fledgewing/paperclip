@@ -29,6 +29,16 @@ import { systemdServiceName } from "../services/service-manager.js";
 
 const ORIGINAL_ENV = { ...process.env };
 
+// Never let uninstallCommand reach the host service manager: launchd/systemd
+// domains are per-user, not per-HOME, so a temp HOME does not isolate them.
+function fakeServiceManager() {
+  const manager = {
+    status: vi.fn(async () => ({ installed: true, active: true })),
+    uninstall: vi.fn(async () => undefined),
+  };
+  return { manager, detectServiceManager: vi.fn(async () => ({ supported: true as const, manager: manager as never })) };
+}
+
 describe("managed install commands", () => {
   let root: string;
 
@@ -335,8 +345,10 @@ describe("managed install commands", () => {
     fs.mkdirSync(paths.cliRoot, { recursive: true });
     fs.writeFileSync(unrelatedFile, "keep");
 
-    await expect(uninstallCommand()).rejects.toThrow("unverified install store");
+    const service = fakeServiceManager();
+    await expect(uninstallCommand({ detectServiceManager: service.detectServiceManager })).rejects.toThrow("unverified install store");
     expect(fs.readFileSync(unrelatedFile, "utf8")).toBe("keep");
+    expect(service.manager.uninstall).not.toHaveBeenCalled();
   });
 
   it("refuses to uninstall while another store mutation holds the lock", async () => {
@@ -355,12 +367,14 @@ describe("managed install commands", () => {
       previous: [],
     }, paths);
 
+    const service = fakeServiceManager();
     await withInstallStoreLock(
       async () => {
-        await expect(uninstallCommand()).rejects.toThrow("already running");
+        await expect(uninstallCommand({ detectServiceManager: service.detectServiceManager })).rejects.toThrow("already running");
       },
       paths,
     );
+    expect(service.manager.uninstall).not.toHaveBeenCalled();
     expect(fs.existsSync(paths.lockPath)).toBe(false);
   });
 
