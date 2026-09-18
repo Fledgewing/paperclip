@@ -174,6 +174,7 @@ import {
   classifyIssueGraphLiveness,
   classifyIssueReviewPaths,
   type IssueGraphLivenessInput,
+  type IssueLivenessCommentInput,
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -4505,6 +4506,77 @@ function reviewAttentionNone(): IssueReviewAttention {
   return { state: "none", paths: [], reason: null };
 }
 
+const ISSUE_LIVENESS_COMMENT_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
+
+async function listRecentIssueLivenessComments(
+  dbOrTx: any,
+  companyId: string,
+  issueIds: string[],
+  now: Date,
+): Promise<IssueLivenessCommentInput[]> {
+  const uniqueIssueIds = [...new Set(issueIds.filter((id) => typeof id === "string" && id.length > 0))];
+  if (uniqueIssueIds.length === 0) return [];
+  const cutoff = new Date(now.getTime() - ISSUE_LIVENESS_COMMENT_LOOKBACK_MS);
+  const rows = await dbOrTx
+    .select({
+      id: issueComments.id,
+      companyId: issueComments.companyId,
+      issueId: issueComments.issueId,
+      authorAgentId: issueComments.authorAgentId,
+      authorUserId: issueComments.authorUserId,
+      body: issueComments.body,
+      createdAt: issueComments.createdAt,
+    })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.companyId, companyId),
+        inArray(issueComments.issueId, uniqueIssueIds),
+        isNull(issueComments.deletedAt),
+        gte(issueComments.createdAt, cutoff),
+      ),
+    )
+    .orderBy(asc(issueComments.createdAt));
+  return rows.map((row: {
+    id: string;
+    companyId: string;
+    issueId: string;
+    authorAgentId: string | null;
+    authorUserId: string | null;
+    body: string;
+    createdAt: Date;
+  }) => ({
+    id: row.id,
+    companyId: row.companyId,
+    issueId: row.issueId,
+    authorAgentId: row.authorAgentId,
+    authorUserId: row.authorUserId,
+    body: row.body,
+    createdAt: row.createdAt,
+  }));
+}
+
+function blockerLeafIdsForLivenessSuppression(
+  graphIssueRows: Array<{ id: string; status: string }>,
+  graphRelationRows: Array<{ blockerIssueId: string }>,
+): string[] {
+  if (graphIssueRows.length === 0 || graphRelationRows.length === 0) return [];
+  const backlogIds = new Set<string>();
+  for (const issue of graphIssueRows) {
+    if (issue.status === "backlog") backlogIds.add(issue.id);
+  }
+  if (backlogIds.size === 0) return [];
+  const seen = new Set<string>();
+  const leaves: string[] = [];
+  for (const relation of graphRelationRows) {
+    if (!backlogIds.has(relation.blockerIssueId)) continue;
+    if (seen.has(relation.blockerIssueId)) continue;
+    seen.add(relation.blockerIssueId);
+    leaves.push(relation.blockerIssueId);
+  }
+  return leaves;
+}
+
 async function listIssueReviewAttentionMap(
   dbOrTx: any,
   companyId: string,
@@ -4742,6 +4814,8 @@ async function listIssueReviewAttentionMap(
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
       monitorAttemptCount: issue.monitorAttemptCount,
+      // priorityChangedAt is intentionally left unsupplied here — see the
+      // blocked-inbox wiring below for the rationale (CAN-3937/3938).
     })),
     relations: [],
     agents: agentRows,
@@ -4750,6 +4824,14 @@ async function listIssueReviewAttentionMap(
     pendingInteractions: interactionRows,
     pendingApprovals: approvalRows,
     openRecoveryIssues: recoveryPaths,
+    // The review map never loads `relations`, so there is no reachable
+    // backlog blocker and `blocked_by_assigned_backlog_issue` cannot
+    // fire here. Pass an empty recent-comments list so the predicate
+    // has no context to consider — this preserves backward-compatible
+    // behavior for the only findings this map emits (review-path
+    // findings). The blocked-inbox map is the call site where the
+    // parked-by-design suppression actually takes effect.
+    recentCommentsByIssueId: [],
     now: new Date(),
   };
   const findingsByIssueId = new Map(
@@ -5820,6 +5902,18 @@ async function listIssueBlockedInboxAttentionMap(
       return entries;
     });
 
+  const blockerLeafIds = blockerLeafIdsForLivenessSuppression(
+    graphIssues,
+    graphRelations,
+  );
+  const livenessNow = new Date();
+  const recentCommentsByIssueId = await listRecentIssueLivenessComments(
+    dbOrTx,
+    companyId,
+    blockerLeafIds,
+    livenessNow,
+  );
+
   const findings = classifyIssueGraphLiveness({
     issues: graphIssues.map((issue) => ({
       id: issue.id,
@@ -5838,6 +5932,12 @@ async function listIssueBlockedInboxAttentionMap(
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
       monitorAttemptCount: issue.monitorAttemptCount,
+      // priorityChangedAt is intentionally left unsupplied — the schema
+      // has no priority_changed_at column and CAN-3937 explicitly ruled
+      // out a migration for this rule. Substituting issue.updatedAt
+      // would silently disable suppression on any unrelated write, so
+      // the residual hole (a bare priority escalation with no comment)
+      // is accepted as scoped to this call site. CAN-3937/CAN-3938.
     })),
     relations: graphRelations,
     agents: companyAgents,
@@ -5888,7 +5988,8 @@ async function listIssueBlockedInboxAttentionMap(
     pendingInteractions,
     pendingApprovals,
     openRecoveryIssues,
-    now: new Date(),
+    recentCommentsByIssueId,
+    now: livenessNow,
   });
   const findingByIssueId = new Map<string, IssueLivenessFinding>();
   for (const finding of findings) {
