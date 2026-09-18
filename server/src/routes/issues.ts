@@ -274,7 +274,7 @@ import {
   readAcceptedPlanConfirmationTarget,
   type IssuePostCommitAction,
 } from "../services/issues.js";
-import { authorizationDeniedDetails } from "../services/authorization.js";
+import { authorizationDeniedDetails, authorizationService } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
@@ -5801,10 +5801,24 @@ export function issueRoutes(
 
     const isCreator = interaction.createdByAgentId === actorAgentId;
     const isAssignee = issue.assigneeAgentId === actorAgentId;
-    if (!isCreator && !isAssignee) {
+    // A card whose creator has moved on is otherwise unclearable: only the
+    // creator could withdraw it, and nothing obliges the creator to come back.
+    // The creator's supervisor is the actor with both the standing and the
+    // motive to sweep, and withdrawal is strictly less destructive than the
+    // rejection any non-addressed resolver can already perform.
+    const isCreatorSupervisor =
+      !isCreator &&
+      !isAssignee &&
+      Boolean(interaction.createdByAgentId) &&
+      (await authorizationService(db).isManagerOf(
+        issue.companyId,
+        actorAgentId,
+        interaction.createdByAgentId as string,
+      ));
+    if (!isCreator && !isAssignee && !isCreatorSupervisor) {
       res.status(403).json({
         error:
-          "Only the interaction creator, current issue assignee, or a board user may withdraw it",
+          "Only the interaction creator, a supervisor of the creator, the current issue assignee, or a board user may withdraw it",
       });
       return false;
     }

@@ -54,6 +54,7 @@ function baseStalenessFacts(): QueuedRunFacts {
     issueExecutionRunId: "run-1",
     isResolvedInteractionContinuation: false,
     isInteractionWake: false,
+    isAuthorizedAddresseeInteractionWake: false,
     isAuthorizedSourceScopedRecovery: false,
     isNonAssigneeWorkspaceBusyRetry: false,
     resumeIntent: false,
@@ -386,6 +387,38 @@ describe("decideQueuedRunStaleness", () => {
         isInteractionWake: true,
         wakeCommentIdPresent: true,
       }, NOW)).toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
+    });
+  });
+
+  // CAN-4817. The wake fired at an interaction's addressee is a deliberate
+  // non-assignee run. Before this, the ownership gate had no exemption for it,
+  // so every addressee wake at a non-assignee was cancelled as
+  // `issue_assignee_changed` before it could start — 27 of 28 on the reporting
+  // instance, none of which ever reached `started_at`.
+  it("lets an authorized addressee interaction wake run while the issue is assigned to someone else", () => {
+    const facts: QueuedRunFacts = {
+      ...baseStalenessFacts(),
+      runAgentId: "agent-addressee",
+      issueAssigneeAgentId: "agent-1",
+      wakeReason: "interaction_pending",
+      isAuthorizedAddresseeInteractionWake: true,
+    };
+    expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
+  });
+
+  it("still cancels an addressee-shaped wake whose addressee claim was not authorized", () => {
+    const facts: QueuedRunFacts = {
+      ...baseStalenessFacts(),
+      runAgentId: "agent-addressee",
+      issueAssigneeAgentId: "agent-1",
+      wakeReason: "interaction_pending",
+      // The context snapshot claimed an addressee wake, but the database did
+      // not confirm a pending interaction addressed to this agent.
+      isAuthorizedAddresseeInteractionWake: false,
+    };
+    expect(decideQueuedRunStaleness(facts, NOW)).toMatchObject({
+      stale: true,
+      errorCode: "issue_assignee_changed",
     });
   });
 

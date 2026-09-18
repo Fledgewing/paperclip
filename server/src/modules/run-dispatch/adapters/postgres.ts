@@ -6,6 +6,7 @@ import {
   agents,
   heartbeatRuns,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
 import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
@@ -40,6 +41,7 @@ import {
   deriveCommentId,
   isNonAssigneeWorkspaceBusyRetry,
   isResolvedInteractionContinuationWakeContext,
+  readAddresseeInteractionWakeInteractionId,
 } from "../domain/wake-context.js";
 import type {
   CancelStaleQueuedRunInput,
@@ -504,6 +506,30 @@ export function createPostgresRunDispatchAdapter(
       continuationParksExecutor = continuationSummaryParksExecutor(continuationSummaryBody);
     }
 
+    // An addressee wake is a deliberate non-assignee run. Excuse it from the
+    // ownership check only when the row still backs the claim the context
+    // snapshot makes: same company and issue, this run's agent as addressee,
+    // and the card still pending. A resolved or reassigned card leaves the
+    // queued run stale exactly as before.
+    const addresseeWakeInteractionId = readAddresseeInteractionWakeInteractionId(context);
+    const isAuthorizedAddresseeInteractionWake =
+      issue && addresseeWakeInteractionId
+        ? await dbOrTx
+            .select({ id: issueThreadInteractions.id })
+            .from(issueThreadInteractions)
+            .where(
+              and(
+                eq(issueThreadInteractions.id, addresseeWakeInteractionId),
+                eq(issueThreadInteractions.companyId, input.companyId),
+                eq(issueThreadInteractions.issueId, issue.id),
+                eq(issueThreadInteractions.addresseeAgentId, input.agentId),
+                eq(issueThreadInteractions.status, "pending"),
+              ),
+            )
+            .limit(1)
+            .then((rows) => Boolean(rows[0]))
+        : false;
+
     const recoveryActionId = readNonEmptyString(context.recoveryActionId);
     const isAuthorizedSourceScopedRecovery =
       issue && wakeReason === "source_scoped_recovery_action" && recoveryActionId
@@ -537,6 +563,7 @@ export function createPostgresRunDispatchAdapter(
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
+      isAuthorizedAddresseeInteractionWake,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,

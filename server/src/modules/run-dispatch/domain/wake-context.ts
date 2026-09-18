@@ -86,6 +86,31 @@ export function allowsIssueInteractionWake(
   return Boolean(deriveCommentId(contextSnapshot));
 }
 
+export const ADDRESSEE_INTERACTION_WAKE_REASON = "interaction_pending";
+
+/**
+ * Reads the interaction id off the wake fired at an interaction's
+ * `addresseeAgentId` when the card is created. Such a run is a deliberate
+ * non-assignee run, so the ownership gate needs to tell it apart from a
+ * genuinely displaced assignee.
+ *
+ * This is only the shape test. It reads a claim off the run's own context
+ * snapshot and is therefore not authority on its own: the caller must still
+ * confirm against the database that the run's agent really is the addressee of
+ * a still-pending interaction on the issue before excusing the ownership check.
+ */
+export function readAddresseeInteractionWakeInteractionId(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): string | null {
+  if (readNonEmptyString(contextSnapshot?.wakeReason) !== ADDRESSEE_INTERACTION_WAKE_REASON) {
+    return null;
+  }
+  // A resolved-interaction continuation carries a terminal interactionStatus
+  // and travels its own path; only the create-time pending wake qualifies.
+  if (readNonEmptyString(contextSnapshot?.interactionStatus)) return null;
+  return readNonEmptyString(contextSnapshot?.interactionId);
+}
+
 export function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown): boolean {
   const context = parseObject(contextSnapshot);
   const interactionId = readNonEmptyString(context.interactionId);

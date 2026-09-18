@@ -2405,5 +2405,10 @@ export function authorizationService(db: Db | DbTransaction) {
   return {
     decide,
     decidePrincipalGrant,
+    // Read-only supervision predicate over the `reportsTo` tree. It already
+    // underpins assignment authority above; it is exposed so callers asking
+    // the same "is this actor above that agent" question do not re-implement
+    // the traversal with a different depth cap or cycle guard.
+    isManagerOf,
   };
 }

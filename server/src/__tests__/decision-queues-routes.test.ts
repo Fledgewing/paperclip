@@ -489,4 +489,50 @@ describeEmbeddedPostgres("decision queue routes", () => {
       .expect(404);
     expect(unauthorized.body).toEqual(missing.body);
   });
+
+  // CAN-4817. The seeder added an item when an interaction started pending and
+  // nothing removed it when the interaction reached a terminal state, so the
+  // board's queue badges counted mostly-dead rows (48 rows on the reporting
+  // instance, 1 of them still pending).
+  it("hides and reaps queue items whose interaction has left pending", async () => {
+    const { companyId, issueId, interactionId } = await seed();
+    const board = boardActor(companyId);
+    const resolvedId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: resolvedId,
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "answered",
+      payload: { version: 1, questions: [] } as never,
+    });
+
+    await request(app(board)).post(`/api/companies/${companyId}/decision-queues`).send({
+      key: "questions",
+      title: "Questions",
+    }).expect(201);
+    for (const sourceId of [interactionId, resolvedId]) {
+      await request(app(board))
+        .post(`/api/companies/${companyId}/decision-queues/questions/items`)
+        .send({ sourceKind: "issue_thread_interaction", sourceId })
+        .expect(201);
+    }
+    expect(await db.select().from(decisionQueueItems).where(eq(decisionQueueItems.companyId, companyId)))
+      .toHaveLength(2);
+
+    // The badge and the list must apply the same rule; both derive from the
+    // one visibility function, so they cannot disagree.
+    const items = await request(app(board))
+      .get(`/api/companies/${companyId}/decision-queues/questions/items`).expect(200);
+    expect(items.body.map((item: { sourceId: string }) => item.sourceId)).toEqual([interactionId]);
+    const queues = await request(app(board)).get(`/api/companies/${companyId}/decision-queues`).expect(200);
+    expect(queues.body.find((queue: { key: string }) => queue.key === "questions").itemCount).toBe(1);
+
+    // Reaping runs on the same refresh that seeds, and is not scoped to the
+    // refresh's matching items, so it also clears rows seeded earlier.
+    await decisionQueueService(db).materializeSeededQueues(companyId, []);
+    const remaining = await db.select().from(decisionQueueItems)
+      .where(eq(decisionQueueItems.companyId, companyId));
+    expect(remaining.map((item) => item.sourceId)).toEqual([interactionId]);
+  });
 });

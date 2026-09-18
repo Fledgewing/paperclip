@@ -63,6 +63,9 @@ const mockQuestionResponseDeliveries = vi.hoisted(() => ({
 }));
 const mockResolveTaskWatchdogMutationScope = vi.hoisted(() => vi.fn(async () => ({ kind: "none" })));
 const mockResolveCoreTrustPreset = vi.hoisted(() => vi.fn(() => ({ kind: "standard" })));
+// CAN-4817 defect 3. Defaults to false so the existing unrelated-agent denial
+// keeps asserting a denial rather than silently becoming a supervisor grant.
+const mockIsManagerOf = vi.hoisted(() => vi.fn(async () => false));
 const mockRunAttribution = vi.hoisted(() => ({
   value: {
     companyId: "company-1",
@@ -159,6 +162,21 @@ vi.mock("../services/trust-preset-resolver.js", () => ({
 }));
 
 function registerModuleMocks() {
+  // CAN-4817 defect 3: the withdrawal gate now also admits a supervisor of the
+  // card's creator. The supervision predicate itself is the authorization
+  // service's own `reportsTo` traversal; this stubs only that one answer so
+  // the route's composition can be exercised without a live agent tree.
+  vi.doMock("../services/authorization.js", async () => {
+    const actual = await vi.importActual<Record<string, unknown>>("../services/authorization.js");
+    const makeService = actual.authorizationService as (db: unknown) => Record<string, unknown>;
+    return {
+      ...actual,
+      authorizationService: (db: unknown) => ({
+        ...makeService(db),
+        isManagerOf: mockIsManagerOf,
+      }),
+    };
+  });
   vi.doMock("../services/question-response-delivery.js", () => ({
     questionResponseDeliveryService: () => mockQuestionResponseDeliveries,
   }));
@@ -1023,6 +1041,40 @@ describe.sequential("issue thread interaction routes", () => {
 
   it("rejects withdrawal by an unrelated agent", async () => {
     const app = await createApp({ type: "agent", agentId: "33333333-3333-4333-8333-333333333333", companyId: "company-1", runId: RUN_3 });
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-withdraw/withdraw")
+      .send({});
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
+  });
+
+  // CAN-4817 defect 3. A card whose creator has moved on was unclearable by
+  // anyone but that creator, so dead cards accumulated on the decisions desk
+  // and the one actor motivated to sweep them was the one locked out.
+  it("lets a supervisor of the creator withdraw a card it did not create", async () => {
+    mockIsManagerOf.mockResolvedValue(true);
+    const app = await createApp({
+      type: "agent",
+      agentId: UNRELATED_AGENT_ID,
+      companyId: "company-1",
+      runId: RUN_3,
+    });
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-withdraw/withdraw")
+      .send({});
+    expect(res.status).toBe(200);
+    expect(mockIsManagerOf).toHaveBeenCalledWith("company-1", UNRELATED_AGENT_ID, CREATED_AGENT_ID);
+    expect(mockInteractionService.withdrawInteraction).toHaveBeenCalled();
+  });
+
+  it("still rejects an agent that does not supervise the creator", async () => {
+    mockIsManagerOf.mockResolvedValue(false);
+    const app = await createApp({
+      type: "agent",
+      agentId: UNRELATED_AGENT_ID,
+      companyId: "company-1",
+      runId: RUN_3,
+    });
     const res = await request(app)
       .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-withdraw/withdraw")
       .send({});

@@ -5,6 +5,7 @@ import {
   extractWakeCommentIds,
   isNonAssigneeWorkspaceBusyRetry,
   isResolvedInteractionContinuationWakeContext,
+  readAddresseeInteractionWakeInteractionId,
   WORKSPACE_BUSY_RETRY_REASON,
 } from "./wake-context.js";
 
@@ -81,4 +82,33 @@ describe("wake context", () => {
       expect(isResolvedInteractionContinuationWakeContext(null)).toBe(false);
     },
   );
+});
+
+describe("addressee interaction wake context (CAN-4817)", () => {
+  const CONTEXT = {
+    wakeReason: "interaction_pending",
+    interactionId: "interaction-1",
+    // The addressee wake writes sourceCommentId, never wakeCommentId — which
+    // is why allowsIssueInteractionWake could never have recognised it even if
+    // "interaction_pending" had been in the allowed wake-reason set.
+    sourceCommentId: "comment-1",
+  };
+
+  it("reads the interaction id off a create-time addressee wake", () => {
+    expect(readAddresseeInteractionWakeInteractionId(CONTEXT)).toBe("interaction-1");
+  });
+
+  it("is not recognized by the comment-wake classifier", () => {
+    expect(allowsIssueInteractionWake(
+      CONTEXT,
+      new Set(["issue_commented", "issue_reopened_via_comment", "issue_comment_mentioned"]),
+    )).toBe(false);
+  });
+
+  it("ignores other wake reasons, missing ids, and resolved continuations", () => {
+    expect(readAddresseeInteractionWakeInteractionId({ ...CONTEXT, wakeReason: "issue_commented" })).toBeNull();
+    expect(readAddresseeInteractionWakeInteractionId({ ...CONTEXT, interactionId: "" })).toBeNull();
+    expect(readAddresseeInteractionWakeInteractionId({ ...CONTEXT, interactionStatus: "accepted" })).toBeNull();
+    expect(readAddresseeInteractionWakeInteractionId(null)).toBeNull();
+  });
 });

@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -366,17 +366,98 @@ export function decisionQueueService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
+  /**
+   * Source ids of the interaction-sourced rows whose interaction has left
+   * `pending`.
+   *
+   * A queue item exists to say "someone still has to decide this". Once the
+   * underlying interaction is answered, accepted, rejected, expired, or
+   * cancelled there is nothing left to decide, so the row is dead weight on
+   * the board's badge. The seeder adds items and nothing used to remove them.
+   *
+   * `decision_queue_items.source_id` is `text` and
+   * `issue_thread_interactions.id` is `uuid`, so the comparison casts.
+   */
+  async function staleInteractionSourceIds(
+    companyId: string,
+    rows: readonly (typeof decisionQueueItems.$inferSelect)[],
+  ) {
+    const sourceIds = [...new Set(
+      rows.filter((row) => row.sourceKind === "issue_thread_interaction").map((row) => row.sourceId),
+    )];
+    if (sourceIds.length === 0) return new Set<string>();
+    // Deliberately keyed on an interaction that exists and has left `pending`,
+    // not on "not currently pending". A source row that is absent is a
+    // different lifecycle — it is already hidden by canReadDecisionSource, and
+    // treating it as stale would let this race an insert that has not
+    // committed yet.
+    return db
+      .select({ id: issueThreadInteractions.id })
+      .from(issueThreadInteractions)
+      .where(and(
+        eq(issueThreadInteractions.companyId, companyId),
+        ne(issueThreadInteractions.status, "pending"),
+        inArray(sql`${issueThreadInteractions.id}::text`, sourceIds),
+      ))
+      .then((found) => new Set(found.map((row) => String(row.id))));
+  }
+
   async function visibleItems(companyId: string, queueId: string, authActor: AuthorizationActor) {
     const rows = await db.select().from(decisionQueueItems)
       .where(and(eq(decisionQueueItems.companyId, companyId), eq(decisionQueueItems.queueId, queueId)))
       .orderBy(desc(decisionQueueItems.createdAt), desc(decisionQueueItems.id));
+    // The badge count and the item list are both derived from this one
+    // function, so a filter added here cannot make the two disagree.
+    const stale = await staleInteractionSourceIds(companyId, rows);
     const visible: DecisionQueueItem[] = [];
     for (const row of rows) {
+      if (row.sourceKind === "issue_thread_interaction" && stale.has(row.sourceId)) continue;
       if (await canReadDecisionSource(db, authActor, companyId, row.sourceKind as AttentionSourceKind, row.sourceId)) {
         visible.push(toQueueItem(row));
       }
     }
     return visible;
+  }
+
+  /**
+   * Deletes queue items whose interaction has left `pending`. This runs on the
+   * same attention-feed refresh that seeds them, so reaping keeps the cadence
+   * of creation and no individual transition site has to remember to call it.
+   * It is deliberately not scoped to the refresh's matching items, so it also
+   * clears rows seeded before this existed.
+   */
+  async function reapResolvedInteractionItems(companyId: string) {
+    const rows = await db.select().from(decisionQueueItems)
+      .where(and(
+        eq(decisionQueueItems.companyId, companyId),
+        eq(decisionQueueItems.sourceKind, "issue_thread_interaction"),
+      ));
+    const stale = await staleInteractionSourceIds(companyId, rows);
+    if (stale.size === 0) return 0;
+    const doomed = rows.filter((row) => stale.has(row.sourceId));
+    await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await txDb.delete(decisionQueueItems).where(and(
+        eq(decisionQueueItems.companyId, companyId),
+        inArray(decisionQueueItems.id, doomed.map((row) => row.id)),
+      ));
+      for (const row of doomed) {
+        await txDb.insert(decisionTriageEvents).values({
+          companyId,
+          queueId: row.queueId,
+          sourceKind: row.sourceKind,
+          sourceId: row.sourceId,
+          action: "queue_item.removed",
+          ...eventActorColumns(SYSTEM_ACTOR),
+          details: { reason: "interaction_no_longer_pending" },
+        });
+      }
+      for (const queueId of new Set(doomed.map((row) => row.queueId))) {
+        await txDb.update(decisionQueues).set({ updatedAt: new Date() })
+          .where(and(eq(decisionQueues.companyId, companyId), eq(decisionQueues.id, queueId)));
+      }
+    });
+    return doomed.length;
   }
 
   return {
@@ -681,7 +762,13 @@ export function decisionQueueService(db: Db) {
       });
     },
 
+    reapResolvedInteractionItems,
+
     materializeSeededQueues: async (companyId: string, items: AttentionItem[]) => {
+      // Reap before seeding, and before the empty-input early return: a
+      // refresh that matches nothing is exactly when a queue full of resolved
+      // cards needs clearing.
+      await reapResolvedInteractionItems(companyId);
       if (items.length === 0) return;
       const issueIds = [...new Set(items.map(itemIssueId).filter((id): id is string => Boolean(id)))];
       const prIssueIds = new Set(issueIds.length === 0 ? [] : await db

@@ -21,6 +21,8 @@ export {
   deriveCommentId,
   allowsIssueInteractionWake,
   isResolvedInteractionContinuationWakeContext,
+  ADDRESSEE_INTERACTION_WAKE_REASON,
+  readAddresseeInteractionWakeInteractionId,
 } from "./domain/wake-context.js";
 export type {
   RetryReasonKind,
