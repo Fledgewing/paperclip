@@ -18,6 +18,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import type { AttentionItem } from "@paperclipai/shared";
+import { ISSUE_THREAD_INTERACTION_STATUSES } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -534,5 +535,93 @@ describeEmbeddedPostgres("decision queue routes", () => {
     const remaining = await db.select().from(decisionQueueItems)
       .where(eq(decisionQueueItems.companyId, companyId));
     expect(remaining.map((item) => item.sourceId)).toEqual([interactionId]);
+  });
+
+  // CAN-4831. The test above proves the reap for exactly one terminal status
+  // ("answered"), which is the one that happened to motivate CAN-4817. The
+  // reap's predicate is `status <> 'pending'`, so it should cover every other
+  // status too — but "should" is not a test, and a future status added to
+  // ISSUE_THREAD_INTERACTION_STATUSES could arrive with a hand-rolled
+  // allow-list somewhere in the chain and silently reintroduce the leak.
+  //
+  // The cases are derived from the shared constant rather than written out, so
+  // adding a status to that constant without extending the reap fails here
+  // instead of quietly accumulating dead badge weight on /CAN/decisions.
+  //
+  // Note on the "withdrawn" status named in the CAN-4831 definition of done:
+  // there is no such interaction *status*. `withdrawInteraction` writes
+  // status "cancelled" and records "withdrawn" as the resolution outcome, so
+  // withdrawal is covered by the "cancelled" case below. The asserted status
+  // list also includes "failed", which the definition of done did not name.
+  const terminalInteractionStatuses = ISSUE_THREAD_INTERACTION_STATUSES
+    .filter((status) => status !== "pending");
+
+  it("reaps and hides queue items for every terminal interaction status", async () => {
+    // Guards the derivation: if this list changes, the reap and this test must
+    // both be revisited deliberately.
+    expect([...terminalInteractionStatuses].sort()).toEqual([
+      "accepted",
+      "answered",
+      "cancelled",
+      "expired",
+      "failed",
+      "rejected",
+    ]);
+    expect(ISSUE_THREAD_INTERACTION_STATUSES).not.toContain("withdrawn");
+
+    const { companyId, issueId, interactionId } = await seed();
+    const board = boardActor(companyId);
+    await request(app(board)).post(`/api/companies/${companyId}/decision-queues`).send({
+      key: "questions",
+      title: "Questions",
+    }).expect(201);
+
+    const byStatus = new Map<string, string>();
+    for (const status of terminalInteractionStatuses) {
+      const id = randomUUID();
+      byStatus.set(status, id);
+      await db.insert(issueThreadInteractions).values({
+        id,
+        companyId,
+        issueId,
+        kind: "ask_user_questions",
+        status,
+        payload: { version: 1, questions: [] } as never,
+      });
+    }
+    for (const sourceId of [interactionId, ...byStatus.values()]) {
+      await request(app(board))
+        .post(`/api/companies/${companyId}/decision-queues/questions/items`)
+        .send({ sourceKind: "issue_thread_interaction", sourceId })
+        .expect(201);
+    }
+    expect(await db.select().from(decisionQueueItems).where(eq(decisionQueueItems.companyId, companyId)))
+      .toHaveLength(terminalInteractionStatuses.length + 1);
+
+    // Badge and list are both derived from visibleItems, so one assertion on
+    // each proves the pair cannot disagree for any of these statuses.
+    const items = await request(app(board))
+      .get(`/api/companies/${companyId}/decision-queues/questions/items`).expect(200);
+    expect(items.body.map((item: { sourceId: string }) => item.sourceId)).toEqual([interactionId]);
+    const queues = await request(app(board)).get(`/api/companies/${companyId}/decision-queues`).expect(200);
+    expect(queues.body.find((queue: { key: string }) => queue.key === "questions").itemCount).toBe(1);
+
+    await decisionQueueService(db).materializeSeededQueues(companyId, []);
+    const remaining = await db.select().from(decisionQueueItems)
+      .where(eq(decisionQueueItems.companyId, companyId));
+    expect(remaining.map((item) => item.sourceId)).toEqual([interactionId]);
+
+    // Every removal is auditable, one event per reaped row, with the reason
+    // the backfill on the reporting instance was identified by.
+    const events = await db.select().from(decisionTriageEvents).where(and(
+      eq(decisionTriageEvents.companyId, companyId),
+      eq(decisionTriageEvents.sourceKind, "issue_thread_interaction"),
+    ));
+    const removals = events.filter((event) => event.action === "queue_item.removed");
+    expect(removals).toHaveLength(terminalInteractionStatuses.length);
+    expect(new Set(removals.map((event) => event.sourceId)))
+      .toEqual(new Set(byStatus.values()));
+    expect(new Set(removals.map((event) => (event.details as { reason?: string }).reason)))
+      .toEqual(new Set(["interaction_no_longer_pending"]));
   });
 });
